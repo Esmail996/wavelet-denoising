@@ -79,6 +79,9 @@ def DyadicLength(x):
     @param x The input signal (float 1D ndarray)
 
     @return Returns the length m and the least power of 2 greater than m
+
+    @note This function has been taken from the pyYAWT package
+    (https://pyyawt.readthedocs.io/_modules/pyyawt/denoising.html).
     """
     m = x.shape[0]
     j = np.ceil(np.log(m) / np.log(2.)).astype('i')
