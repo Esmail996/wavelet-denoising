@@ -1,9 +1,6 @@
 import numpy as np
-
 from scipy.signal import detrend
-
 from sklearn.preprocessing import MinMaxScaler
-
 from pywt import wavedec, dwt_max_level, Wavelet, threshold, waverec
 
 
@@ -14,9 +11,8 @@ def Energy(x):
     """Computes the energy of a signal. The energy is essentially the
     magnitude of the signal (inner product of x with itself).
 
-    @param x Input signal as numpy array (1D)
-
-    @return The energy of the input signal x
+    param x Input signal as numpy array (1D)
+    return The energy of the input signal x
     """
     return np.dot(x, x)
 
@@ -25,46 +21,27 @@ def EuclideanNorm(x):
     """! Computes the Euclidean norm (p-norm with p=2) of the input
     1D vector (signal) x.
 
-    @param x The input signal (numpy float 1D ndarray)
+    param x The input signal (numpy float 1D ndarray)
 
-    @return The norm of the input signal as a float scaler
+    return The norm of the input signal as a float scaler
     """
     return np.linalg.norm(x)
 
 
 def mad(x):
-    """! Estimates the Median Absolute Deviation (MAD). MAD is defined to be
-    the median of the absolute difference between the input X and median(X).
-
-    @param x The input signal (1D ndarray)
-    @return The median absolute deviation of the input signal
-
-    @note More details on the MAD can be found on the Wikipedia page:
-    please see https://en.wikipedia.org/wiki/Median_absolute_deviation
+    """
+    Estimates the Median Absolute Deviation (MAD). 
+    param x The input signal (1D ndarray)
+    return The median absolute deviation of the input signal
     """
     return 1.482579 * np.median(np.abs(x - np.median(x)))
 
 
-def meanad(x):
-    """! Estimates the Mean Absolute Deviation (MeanAD). MeanAD is defined to
-    be the mean of the absolute difference between the input X and mean(X).
-
-    @param x The input signal (1D ndarray)
-    @return The mean absolute deviation of the input signal
-    """
-    return 1.482579 * np.mean(np.abs(x - np.mean(x)))
-
-
-def grad_g_fun(x, thr=1):
-    return (x >= thr) * 1 + (x <= -thr) * 1 + (np.abs(x) <= thr) * 0
-
-
 def NearestEvenInteger(n):
-    """! Returns the nearest even integer to number n.
+    """ Returns the nearest even integer to number n.
 
-    @param n Input number for which one requires the nearest even integer
-
-    @return The even nearest integer to the input number
+    param n Input number for which one requires the nearest even integer
+    return The even nearest integer to the input number
     """
     if n % 2 == 0:
         res = n
@@ -74,39 +51,15 @@ def NearestEvenInteger(n):
 
 
 def DyadicLength(x):
-    """! Returns the length and the dyadic length of the input 1D array x.
+    """
+    Returns the length and the dyadic length of the input 1D array x.
 
-    @param x The input signal (float 1D ndarray)
-
-    @return Returns the length m and the least power of 2 greater than m
-
-    @note This function has been taken from the pyYAWT package
-    (https://pyyawt.readthedocs.io/_modules/pyyawt/denoising.html).
+    param x The input signal (float 1D ndarray)
+    return Returns the length m and the least power of 2 greater than m
     """
     m = x.shape[0]
     j = np.ceil(np.log(m) / np.log(2.)).astype('i')
     return m, j
-
-
-def SoftHardThresholding(x, thr=1, method='s'):
-    """! Performs either a soft or hard thresholding on the input signal x.
-
-    @param x The 1D input signal
-    @param thr The threshold value (float, default=1)
-    @param method A string that indicates if either the soft or the hard
-    thresholding is being used (default=soft, s for soft, h for hard)
-
-    @return Returns the thresholded signal
-    """
-    if method.lower() == 'h':
-        res = x * (np.abs(x) > thr)
-    elif method.lower() == 's':
-        res = ((x >= thr) * (x - thr) + (x <= -thr) * (x + thr)
-               + (np.abs(x) <= thr) * 0)
-    else:
-        print("Thresholding method not found! Choose s (soft) or h (hard)")
-        res = None
-    return res
 
 
 # =====================================================================
@@ -114,7 +67,8 @@ def SoftHardThresholding(x, thr=1, method='s'):
 # =====================================================================
 def preprocess(signal, normalize=False, scaler=None):
     """Removes trends and optionally normalizes the signal."""
-    xhat = detrend(signal)
+    xhat = signal - np.mean(signal)
+    xhat = detrend(xhat)    
     if normalize:
         scaler = MinMaxScaler(feature_range=(0, 1), copy=True)
         xhat = scaler.fit_transform(xhat.reshape(-1, 1))[:, 0]
@@ -196,7 +150,7 @@ def determine_threshold(signal, method='universal', energy_perc=0.9):
     if method == 'universal':
         return universal_threshold(signal)
     elif method == 'sqtwolog':
-        return universal_threshold(signal, sigma=False)
+        return sqrtlog_threshold(signal, sigma=False)
     elif method == 'stein':
         return stein_threshold(signal)
     elif method == 'heurstein':
