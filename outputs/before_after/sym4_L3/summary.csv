@@ -1,0 +1,17 @@
+signal,wavelet,level,method,thr_mode,std_raw,std_den,std_reduction_pct,plot
+40k_decimated,sym4,3,energy,hard,64.40909542962677,64.40769955940323,0.0021671942669528096,outputs/before_after/sym4_L3/40k_decimated__energy__hard.png
+40k_decimated,sym4,3,universal,hard,64.40909542962677,64.40842943060365,0.0010340139365172384,outputs/before_after/sym4_L3/40k_decimated__universal__hard.png
+40k_decimated,sym4,3,stein,hard,64.40909542962677,64.40842973615197,0.0010335395495938422,outputs/before_after/sym4_L3/40k_decimated__stein__hard.png
+40k_decimated,sym4,3,heurstein,hard,64.40909542962677,64.40842973615197,0.0010335395495938422,outputs/before_after/sym4_L3/40k_decimated__heurstein__hard.png
+50k_decimated,sym4,3,energy,hard,68.2860079803425,68.2841583923551,0.0027085900056429226,outputs/before_after/sym4_L3/50k_decimated__energy__hard.png
+50k_decimated,sym4,3,universal,hard,68.2860079803425,68.2858365585239,0.00025103505634123326,outputs/before_after/sym4_L3/50k_decimated__universal__hard.png
+50k_decimated,sym4,3,stein,hard,68.2860079803425,68.28584468751306,0.00023913073010254474,outputs/before_after/sym4_L3/50k_decimated__stein__hard.png
+50k_decimated,sym4,3,heurstein,hard,68.2860079803425,68.28584468751306,0.00023913073010254474,outputs/before_after/sym4_L3/50k_decimated__heurstein__hard.png
+60k_decimated,sym4,3,energy,hard,77.18785633513173,77.18099957239792,0.008883214354384477,outputs/before_after/sym4_L3/60k_decimated__energy__hard.png
+60k_decimated,sym4,3,universal,hard,77.18785633513173,77.18784786305939,1.0975913492287277e-05,outputs/before_after/sym4_L3/60k_decimated__universal__hard.png
+60k_decimated,sym4,3,stein,hard,77.18785633513173,77.1878558850318,5.831227265622693e-07,outputs/before_after/sym4_L3/60k_decimated__stein__hard.png
+60k_decimated,sym4,3,heurstein,hard,77.18785633513173,77.1878558850318,5.831227265622693e-07,outputs/before_after/sym4_L3/60k_decimated__heurstein__hard.png
+original,sym4,3,energy,hard,317.709295624068,317.2915960197132,0.13147226414458216,outputs/before_after/sym4_L3/original__energy__hard.png
+original,sym4,3,universal,hard,317.709295624068,317.6417794899382,0.02125091555699346,outputs/before_after/sym4_L3/original__universal__hard.png
+original,sym4,3,stein,hard,317.709295624068,317.6418419307867,0.021231262103542866,outputs/before_after/sym4_L3/original__stein__hard.png
+original,sym4,3,heurstein,hard,317.709295624068,317.6418419307867,0.021231262103542866,outputs/before_after/sym4_L3/original__heurstein__hard.png

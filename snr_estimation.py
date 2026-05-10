@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import detrend
 
-from bandpass import bandpass
+from preprocess import bandpass
 from roi_windows import ROI_WINDOWS, parse_distance_cm
 
 # ============================================================
@@ -509,6 +509,266 @@ def compute_denoising_snr_improvement(detail_df: pd.DataFrame, denoised_root: st
     return per_trial_df, summary_condition, summary_overall_band
 
 # ============================================================
+# Direct raw-vs-denoised comparison (no roi_dataset.pkl needed)
+# ============================================================
+
+def compute_direct_raw_vs_denoised_snr(
+    raw_root: str,
+    denoised_root: str,
+    denoised_ref_path: str | None,
+    bands_hz: list,
+    bw_hz: float,
+    bp_method: str,
+    iir_order: int,
+    fir_numtaps: int,
+    fir_window: str,
+    mic: str,
+    fs_hz: float,
+    raw_ref_path: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Walk every raw measurement pickle, extract ROIs, and compute SNR for:
+      - raw signal (DC+detrend+bandpass) vs raw reference noise
+      - denoised signal (loaded from denoised_root) vs denoised reference noise
+
+    Does NOT rely on roi_dataset.pkl.  Works for any single-band or multi-band
+    denoised output.
+
+    Returns
+    -------
+    per_trial_df : DataFrame
+        One row per (file, trial, band) with both raw and denoised SNR values.
+    summary_condition : DataFrame
+        Mean/median/std grouped by (object, distance_cm, band_center_hz).
+    summary_overall : DataFrame
+        Mean/median/std grouped by band_center_hz only.
+    """
+    raw_root_path = Path(raw_root)
+    den_root_path = Path(denoised_root)
+
+    # ---- build raw reference noise lookup {band_hz -> {dist_cm -> mean_power}} ----
+    raw_ref = load_pickle(raw_ref_path)
+    if not isinstance(raw_ref, pd.DataFrame):
+        raise TypeError(f"Raw reference pickle at {raw_ref_path!r} must be a DataFrame.")
+    if mic not in raw_ref.columns:
+        raise KeyError(f"Column {mic!r} not found in raw reference DataFrame.")
+
+    raw_ref_signals = np.stack(
+        raw_ref[mic].apply(lambda t: np.asarray(t, dtype=float)).to_list()
+    )
+
+    raw_ref_noise: dict[float, dict[int, float]] = {}
+    for band_hz in bands_hz:
+        band_hz_f = float(band_hz)
+        processed = np.apply_along_axis(
+            lambda x: preprocess_reference_trial(
+                x, fs_hz=fs_hz, center_hz=band_hz_f, bw_hz=bw_hz,
+                order=iir_order, method=bp_method,
+                fir_numtaps=fir_numtaps, fir_window=fir_window,
+            ),
+            axis=1,
+            arr=raw_ref_signals,
+        )
+        raw_ref_noise[band_hz_f] = {}
+        for dist_cm, (start, end) in ROI_WINDOWS.items():
+            roi_slice = processed[:, start:end]
+            if roi_slice.shape[1] == 0:
+                continue
+            powers = np.mean(roi_slice ** 2, axis=1)
+            raw_ref_noise[band_hz_f][dist_cm] = float(np.mean(powers))
+
+    # ---- build denoised reference noise lookup {band_hz -> {dist_cm -> mean_power}} ----
+    den_ref_noise: dict[float, dict[int, float]] = {}
+    if denoised_ref_path:
+        den_ref_pkl = Path(denoised_ref_path)
+    else:
+        den_ref_pkl = den_root_path / "referenz" / "referenz.pickle"
+
+    if den_ref_pkl.exists():
+        den_ref = load_pickle(str(den_ref_pkl))
+        if isinstance(den_ref, dict):
+            for band_hz in bands_hz:
+                band_hz_f = float(band_hz)
+                band_key = next(
+                    (k for k in den_ref if np.isclose(float(k), band_hz_f)), None
+                )
+                if band_key is None:
+                    continue
+                den_ref_trials = den_ref[band_key]
+                den_ref_noise[band_hz_f] = {}
+                for dist_cm, (start, end) in ROI_WINDOWS.items():
+                    powers = []
+                    for t in den_ref_trials:
+                        sig = np.asarray(t, dtype=float)
+                        i1 = min(int(end), len(sig))
+                        if i1 > int(start):
+                            roi = sig[int(start):i1]
+                            if roi.size:
+                                powers.append(float(np.mean(roi ** 2)))
+                    if powers:
+                        den_ref_noise[band_hz_f][dist_cm] = float(np.mean(powers))
+
+    # ---- walk measurement files ----
+    rows = []
+    loaded_den: dict[tuple, dict] = {}
+
+    for raw_pickle in sorted(raw_root_path.rglob("*.pickle")):
+        if "referenz" in str(raw_pickle).lower():
+            continue
+
+        obj = raw_pickle.parent.name
+        file_name = raw_pickle.name
+        dist_cm_val = parse_distance_from_filename(file_name)
+        if dist_cm_val is None:
+            continue
+        dist_cm = int(dist_cm_val)
+        if dist_cm not in ROI_WINDOWS:
+            continue
+        roi_start, roi_end = ROI_WINDOWS[dist_cm]
+
+        try:
+            raw_data = load_pickle(str(raw_pickle))
+        except Exception:
+            continue
+
+        # Extract raw Mic2 signal list
+        if isinstance(raw_data, pd.DataFrame):
+            if mic not in raw_data.columns:
+                continue
+            raw_signals = [np.asarray(raw_data[mic].iloc[i], dtype=float)
+                           for i in range(len(raw_data))]
+        elif isinstance(raw_data, np.ndarray) and raw_data.ndim == 3:
+            mic_idx = {"Mic1": 0, "Mic2": 1, "Mic3": 2}.get(mic)
+            if mic_idx is None:
+                continue
+            raw_signals = [np.asarray(raw_data[mic_idx, i], dtype=float)
+                           for i in range(raw_data.shape[1])]
+        elif isinstance(raw_data, dict) and mic in raw_data:
+            raw_signals = [np.asarray(raw_data[mic][i], dtype=float)
+                           for i in range(len(raw_data[mic]))]
+        else:
+            continue
+
+        n_trials = len(raw_signals)
+
+        # Load matching denoised pickle (cached)
+        den_cache_key = (obj, file_name)
+        if den_cache_key not in loaded_den:
+            den_file = den_root_path / obj / file_name
+            if den_file.exists():
+                try:
+                    loaded_den[den_cache_key] = load_pickle(str(den_file))
+                except Exception:
+                    loaded_den[den_cache_key] = None
+            else:
+                loaded_den[den_cache_key] = None
+        denoised_data = loaded_den[den_cache_key]
+
+        for band_hz in bands_hz:
+            band_hz_f = float(band_hz)
+
+            raw_ref_pow = raw_ref_noise.get(band_hz_f, {}).get(dist_cm)
+            den_ref_pow = den_ref_noise.get(band_hz_f, {}).get(dist_cm)
+
+            # Denoised band key lookup
+            den_band_key = None
+            if isinstance(denoised_data, dict):
+                den_band_key = next(
+                    (k for k in denoised_data if np.isclose(float(k), band_hz_f)), None
+                )
+
+            for trial_idx in range(n_trials):
+                # Raw SNR
+                raw_snr_db = np.nan
+                raw_roi_power = np.nan
+                if raw_ref_pow is not None:
+                    try:
+                        pp = preprocess_reference_trial(
+                            raw_signals[trial_idx], fs_hz=fs_hz,
+                            center_hz=band_hz_f, bw_hz=bw_hz,
+                            order=iir_order, method=bp_method,
+                            fir_numtaps=fir_numtaps, fir_window=fir_window,
+                        )
+                        i1 = min(roi_end, len(pp))
+                        if i1 > roi_start:
+                            raw_roi = pp[roi_start:i1]
+                            raw_roi_power = float(np.mean(raw_roi ** 2))
+                            p_sig = max(raw_roi_power - raw_ref_pow, EPS)
+                            raw_snr_db = float(10.0 * np.log10(p_sig / max(raw_ref_pow, EPS)))
+                    except Exception:
+                        pass
+
+                # Denoised SNR
+                den_snr_db = np.nan
+                den_roi_power = np.nan
+                if den_band_key is not None and den_ref_pow is not None:
+                    band_list = denoised_data[den_band_key]
+                    if trial_idx < len(band_list):
+                        den_sig = np.asarray(band_list[trial_idx], dtype=float)
+                        i1 = min(roi_end, len(den_sig))
+                        if i1 > roi_start:
+                            den_roi = den_sig[roi_start:i1]
+                            den_roi_power = float(np.mean(den_roi ** 2))
+                            p_sig = max(den_roi_power - den_ref_pow, EPS)
+                            den_snr_db = float(10.0 * np.log10(p_sig / max(den_ref_pow, EPS)))
+
+                rows.append({
+                    "object": obj,
+                    "filename": file_name,
+                    "distance_cm": dist_cm,
+                    "mic": mic,
+                    "trial": trial_idx,
+                    "band_center_hz": int(band_hz_f),
+                    "roi_start": roi_start,
+                    "roi_end": roi_end,
+                    "roi_length": roi_end - roi_start,
+                    "raw_roi_power": raw_roi_power,
+                    "raw_ref_noise_power": raw_ref_pow if raw_ref_pow is not None else np.nan,
+                    "snr_db_raw": raw_snr_db,
+                    "denoised_roi_power": den_roi_power,
+                    "denoised_ref_noise_power": den_ref_pow if den_ref_pow is not None else np.nan,
+                    "snr_db_denoised": den_snr_db,
+                    "snr_improvement_db": (
+                        float(den_snr_db - raw_snr_db)
+                        if np.isfinite(den_snr_db) and np.isfinite(raw_snr_db)
+                        else np.nan
+                    ),
+                })
+
+    per_trial_df = pd.DataFrame(rows)
+    if per_trial_df.empty:
+        return per_trial_df, pd.DataFrame(), pd.DataFrame()
+
+    summary_condition = per_trial_df.groupby(
+        ["object", "distance_cm", "band_center_hz"], as_index=False
+    ).agg(
+        n_trials=("trial", "count"),
+        snr_db_raw_mean=("snr_db_raw", "mean"),
+        snr_db_raw_median=("snr_db_raw", "median"),
+        snr_db_raw_std=("snr_db_raw", "std"),
+        snr_db_denoised_mean=("snr_db_denoised", "mean"),
+        snr_db_denoised_median=("snr_db_denoised", "median"),
+        snr_db_denoised_std=("snr_db_denoised", "std"),
+        snr_improvement_db_mean=("snr_improvement_db", "mean"),
+        snr_improvement_db_median=("snr_improvement_db", "median"),
+        snr_improvement_db_std=("snr_improvement_db", "std"),
+    )
+
+    summary_overall = per_trial_df.groupby(["band_center_hz"], as_index=False).agg(
+        snr_db_raw_mean=("snr_db_raw", "mean"),
+        snr_db_raw_median=("snr_db_raw", "median"),
+        snr_db_raw_std=("snr_db_raw", "std"),
+        snr_db_denoised_mean=("snr_db_denoised", "mean"),
+        snr_db_denoised_median=("snr_db_denoised", "median"),
+        snr_db_denoised_std=("snr_db_denoised", "std"),
+        snr_improvement_db_mean=("snr_improvement_db", "mean"),
+        snr_improvement_db_median=("snr_improvement_db", "median"),
+        snr_improvement_db_std=("snr_improvement_db", "std"),
+    )
+
+    return per_trial_df, summary_condition, summary_overall
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -530,6 +790,51 @@ def build_parser():
         type=str,
         default=DENOISED_ROOT,
         help="Optional root directory containing denoised multiband Mic2 pickles to compute ROI SNR improvement.",
+    )
+    # Direct raw-vs-denoised comparison (no roi_dataset.pkl required)
+    parser.add_argument(
+        "--compare-raw-root",
+        type=str,
+        default=r"Multifrequenz Dataset\Multifrequenz",
+        help="Root directory of raw measurement pickles for direct comparison.",
+    )
+    parser.add_argument(
+        "--compare-denoised-root",
+        type=str,
+        default=None,
+        help="Root directory of denoised pickles for direct comparison. Set this to activate the direct SNR comparison mode.",
+    )
+    parser.add_argument(
+        "--compare-denoised-ref",
+        type=str,
+        default=None,
+        help="Path to denoised reference pickle. Defaults to <compare-denoised-root>/referenz/referenz.pickle.",
+    )
+    parser.add_argument(
+        "--compare-bands-hz",
+        type=float,
+        nargs="+",
+        default=[50_000.0],
+        help="Band center frequencies (Hz) present in the denoised output. E.g. 50000 for the 25-75 kHz wideband run.",
+    )
+    parser.add_argument(
+        "--compare-bw-hz",
+        type=float,
+        default=25_000.0,
+        help="Bandpass half-bandwidth (Hz) used when preprocessing raw signals for comparison. Use 25000 for 25-75 kHz.",
+    )
+    parser.add_argument(
+        "--compare-bp-method",
+        type=str,
+        choices=["fir", "iir"],
+        default="iir",
+        help="Bandpass method used when preprocessing raw signals for comparison.",
+    )
+    parser.add_argument(
+        "--compare-iir-order",
+        type=int,
+        default=6,
+        help="IIR order used when preprocessing raw signals for comparison.",
     )
     return parser
 
@@ -617,6 +922,50 @@ def main():
         denoise_gain_per_trial.to_csv(denoise_gain_trial_path, index=False)
         denoise_gain_summary_condition.to_csv(denoise_gain_summary_condition_path, index=False)
         denoise_gain_summary_overall_band.to_csv(denoise_gain_summary_band_path, index=False)
+
+    # Direct raw-vs-denoised comparison
+    compare_denoised_root = args.compare_denoised_root
+    if compare_denoised_root:
+        compare_denoised_root_abs = os.path.join(here, compare_denoised_root)
+        compare_raw_root_abs = os.path.join(here, args.compare_raw_root)
+        compare_denoised_ref_abs = (
+            os.path.join(here, args.compare_denoised_ref)
+            if args.compare_denoised_ref else None
+        )
+        print(f"\nRunning direct raw-vs-denoised SNR comparison...")
+        print(f"  Raw root       : {compare_raw_root_abs}")
+        print(f"  Denoised root  : {compare_denoised_root_abs}")
+        print(f"  Bands (Hz)     : {args.compare_bands_hz}")
+        print(f"  BW (Hz)        : {args.compare_bw_hz}")
+        print(f"  BP method      : {args.compare_bp_method}")
+        cmp_per_trial, cmp_summary_condition, cmp_summary_overall = compute_direct_raw_vs_denoised_snr(
+            raw_root=compare_raw_root_abs,
+            denoised_root=compare_denoised_root_abs,
+            denoised_ref_path=compare_denoised_ref_abs,
+            bands_hz=args.compare_bands_hz,
+            bw_hz=float(args.compare_bw_hz),
+            bp_method=str(args.compare_bp_method),
+            iir_order=int(args.compare_iir_order),
+            fir_numtaps=int(args.fir_numtaps),
+            fir_window=str(args.fir_window),
+            mic=str(args.mic),
+            fs_hz=float(args.fs_hz),
+            raw_ref_path=reference_path,
+        )
+        cmp_trial_path = os.path.join(out_dir, "direct_snr_comparison_per_trial.csv")
+        cmp_cond_path = os.path.join(out_dir, "direct_snr_comparison_summary_condition.csv")
+        cmp_overall_path = os.path.join(out_dir, "direct_snr_comparison_summary_overall.csv")
+        if not cmp_per_trial.empty:
+            cmp_per_trial.to_csv(cmp_trial_path, index=False)
+            cmp_summary_condition.to_csv(cmp_cond_path, index=False)
+            cmp_summary_overall.to_csv(cmp_overall_path, index=False)
+            print(f"  Saved comparison per-trial  : {cmp_trial_path}")
+            print(f"  Saved comparison by condition: {cmp_cond_path}")
+            print(f"  Saved comparison overall    : {cmp_overall_path}")
+            print("\nDirect comparison overall:")
+            print(cmp_summary_overall.to_string(index=False))
+        else:
+            print("  No matched rows produced. Check paths and band settings.")
 
     print("Saved:")
     print("  ", detail_path)

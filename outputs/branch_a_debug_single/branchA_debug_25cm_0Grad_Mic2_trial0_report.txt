@@ -1,0 +1,18 @@
+Branch A one-signal debug report
+========================================
+input_pickle: Multifrequenz Dataset/Multifrequenz/Box/25cm_0Grad.pickle
+mic: Mic2 | trial: 0
+
+SWT meta
+wavelet=sym6 level=6 noise_level=4 noise_idx=3
+n_original=18000 n_padded=18048 pad_samples=48
+sigma_n=2.89292639844 source=fixed
+level_scale={4: 0.8, 5: 0.5, 6: 0.8}
+
+Per-level thresholds and coeff stats
+L1: T_base=893.464, scale=1, T_final=893.464, before_std=0.0873254, after_std=0, before_nz=0.8650, after_nz=0.0000
+L2: T_base=765.981, scale=1, T_final=765.981, before_std=0.108912, after_std=0, before_nz=0.8662, after_nz=0.0000
+L3: T_base=1072.1, scale=1, T_final=1072.1, before_std=0.804367, after_std=0, before_nz=0.8686, after_nz=0.0000
+L4: T_base=0.640698, scale=0.8, T_final=0.512558, before_std=13.3789, after_std=13.3677, before_nz=0.8735, after_nz=0.5791
+L5: T_base=0.183401, scale=0.5, T_final=0.0917004, before_std=45.724, after_std=45.7239, before_nz=0.8833, after_nz=0.8522
+L6: T_base=0.487452, scale=0.8, T_final=0.389962, before_std=17.4109, after_std=17.405, before_nz=0.9028, after_nz=0.6987

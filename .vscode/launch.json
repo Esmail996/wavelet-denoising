@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Calibrate distance (40kHz, Mic2, n_trials=10)",
+      "type": "depugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/calibrate_distance_all_files_ntrials.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--root", "Multifrequenz_Dataset_extracted",
+        "--outdir", "outputs_global_calibration_ntrials",
+        "--n_trials", "10",
+        "--f0", "40000",
+        "--decim_q", "10",
+        "--gate_halfwidth_ms", "0.8",
+        "--edge_ignore_ms", "0.05",
+        "--method", "stein",
+        "--wavelet", "sym6",
+        "--level", "4",
+        "--thr_mode", "soft"
+      ]
+    }
+  ]
+}

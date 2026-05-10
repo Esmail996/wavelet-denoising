@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import detrend
 
-from bandpass import bandpass
+from preprocess import bandpass
 from roi_windows import ROI_DISTANCES_CM, ROI_STARTS, ROI_LEN, parse_distance_cm
 
 

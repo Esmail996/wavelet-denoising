@@ -1,0 +1,270 @@
+"""
+classify_features.py — material classification benchmark.
+
+For each of three feature families (F1, F2, F3) and four classifiers (LR,
+RF, LightGBM, RBF-SVM), runs StratifiedGroupKFold cross-validation grouped
+by (distance_cm, angle_deg) so that the classifier never sees the same
+(distance, angle) configuration in train and test.
+
+Two variants per (family, classifier) combo:
+    - "without distance/angle in features": clean material-only test
+    - "with distance/angle in features"   : informative-of-deployment test
+
+Reports:
+    - per-fold accuracy + macro F1
+    - aggregated confusion matrix
+    - per-(distance, angle) accuracy heatmap
+    - permutation importance for the top features
+
+USAGE (your machine):
+    python classify_features.py \
+        --features-csv outputs/features_all.csv \
+        --output-dir   outputs/classification_results
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,
+                             balanced_accuracy_score, classification_report)
+from sklearn.pipeline import Pipeline
+
+
+META_COLS = ("category", "distance_cm", "angle_deg", "trial")
+LABEL_COL = "category"
+
+
+def is_family15_col(c: str) -> bool:
+    """Family-1.5 columns: cepstral coeffs (_cep_NN) and cross-channel ratios."""
+    if "_cep_" in c:
+        return True
+    if "_dlog_energy" in c or "_dlog_peak" in c:
+        return True
+    if c == "signed_amp_ratio":
+        return True
+    return False
+
+
+def is_family2_col(c: str) -> bool:
+    """Family-2 columns end in _S followed by digits."""
+    parts = c.rsplit("_", 1)
+    return len(parts) == 2 and parts[1].startswith("S") and parts[1][1:].isdigit()
+
+
+def split_feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    """Return (family1_cols, family15_cols, family2_cols)."""
+    f1, f15, f2 = [], [], []
+    for c in df.columns:
+        if c in META_COLS:
+            continue
+        if is_family15_col(c):
+            f15.append(c)
+        elif is_family2_col(c):
+            f2.append(c)
+        else:
+            f1.append(c)
+    return f1, f15, f2
+
+
+def make_classifiers(class_weight="balanced"):
+    """Return dict of name → sklearn-compatible estimator (uninstantiated pipeline)."""
+    out = {
+        "LR-L2": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(C=1.0, max_iter=2000,
+                                       class_weight=class_weight)),
+        ]),
+        "RandomForest": RandomForestClassifier(
+            n_estimators=300, max_depth=None,
+            class_weight=class_weight, n_jobs=-1, random_state=0,
+        ),
+        "RBF-SVM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", SVC(C=10.0, gamma="scale",
+                        class_weight=class_weight, random_state=0)),
+        ]),
+    }
+    # LightGBM if available
+    try:
+        from lightgbm import LGBMClassifier
+        out["LightGBM"] = LGBMClassifier(
+            n_estimators=400, num_leaves=63, learning_rate=0.05,
+            class_weight=class_weight, n_jobs=-1, random_state=0, verbosity=-1,
+        )
+    except ImportError:
+        print("  (LightGBM not installed — skipping)")
+    return out
+
+
+def evaluate_fold(clf, X_train, y_train, X_test, y_test):
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    return {
+        "y_true": y_test, "y_pred": y_pred,
+        "acc": accuracy_score(y_test, y_pred),
+        "macro_f1": f1_score(y_test, y_pred, average="macro"),
+        "balanced_acc": balanced_accuracy_score(y_test, y_pred),
+    }
+
+
+def run_cv(df: pd.DataFrame, feat_cols: Sequence[str], clf_name: str,
+           clf, n_splits: int = 5, seed: int = 0) -> dict:
+    """Run StratifiedGroupKFold by (distance, angle). Each fold holds out
+    a set of (distance, angle) cells across all 3 objects."""
+    df = df.dropna(subset=list(feat_cols) + [LABEL_COL]).reset_index(drop=True)
+    X = df[list(feat_cols)].values.astype(np.float32)
+    y = df[LABEL_COL].values
+    # Group: distinct (distance, angle) cells. There are 25.
+    groups = df["distance_cm"].astype(str) + "_" + df["angle_deg"].astype(str)
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    fold_results = []
+    all_true, all_pred, all_groups = [], [], []
+    for fold, (tr_idx, te_idx) in enumerate(sgkf.split(X, y, groups)):
+        # Important: fit-transform scaler within fold (no leakage)
+        from sklearn.base import clone
+        c = clone(clf)
+        res = evaluate_fold(c, X[tr_idx], y[tr_idx], X[te_idx], y[te_idx])
+        res["fold"] = fold
+        fold_results.append(res)
+        all_true.extend(res["y_true"].tolist())
+        all_pred.extend(res["y_pred"].tolist())
+        all_groups.extend(groups.iloc[te_idx].tolist())
+
+    agg = {
+        "clf": clf_name,
+        "n_features": len(feat_cols),
+        "n_trials": len(df),
+        "mean_acc": float(np.mean([r["acc"] for r in fold_results])),
+        "std_acc": float(np.std([r["acc"] for r in fold_results])),
+        "mean_macro_f1": float(np.mean([r["macro_f1"] for r in fold_results])),
+        "mean_balanced_acc": float(np.mean([r["balanced_acc"] for r in fold_results])),
+        "fold_results": fold_results,
+        "all_true": all_true,
+        "all_pred": all_pred,
+        "all_groups": all_groups,
+    }
+    return agg
+
+
+def per_cell_accuracy(all_true, all_pred, all_groups) -> pd.DataFrame:
+    """Per (distance, angle) accuracy."""
+    df = pd.DataFrame({"true": all_true, "pred": all_pred, "grp": all_groups})
+    df["correct"] = (df["true"] == df["pred"]).astype(int)
+    parts = df["grp"].str.split("_", expand=True)
+    df["distance_cm"] = parts[0].astype(int)
+    df["angle_deg"] = parts[1].astype(int)
+    return df.groupby(["distance_cm", "angle_deg"])["correct"].mean().unstack()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--features-csv", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--add-distance-angle", action="store_true",
+                        help="Include distance_cm + angle_deg as features")
+    args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading features from {args.features_csv}")
+    df = pd.read_csv(args.features_csv)
+    print(f"  {len(df)} rows × {df.shape[1]} cols")
+    print(f"  classes: {df[LABEL_COL].value_counts().to_dict()}")
+
+    f1_cols, f15_cols, f2_cols = split_feature_columns(df)
+    print(f"  Family 1   features: {len(f1_cols)}")
+    print(f"  Family 1.5 features: {len(f15_cols)}")
+    print(f"  Family 2   features: {len(f2_cols)}")
+
+    families = {
+        "F1": f1_cols,
+        "F15": f15_cols,
+        "F2": f2_cols,
+        "F1+F15": f1_cols + f15_cols,
+        "F1+F2": f1_cols + f2_cols,
+        "F15+F2": f15_cols + f2_cols,
+        "F1+F15+F2_full_hybrid": f1_cols + f15_cols + f2_cols,
+    }
+    if args.add_distance_angle:
+        new_families = {}
+        for k, cols in families.items():
+            new_families[k + "_with_da"] = cols + ["distance_cm", "angle_deg"]
+        families.update(new_families)
+
+    classifiers = make_classifiers()
+
+    summary_rows = []
+    all_per_cell = {}
+    all_confusion = {}
+
+    for fam_name, cols in families.items():
+        if not cols:
+            continue
+        print(f"\n=== Family {fam_name} ({len(cols)} features) ===")
+        for clf_name, clf in classifiers.items():
+            print(f"  Training {clf_name}...")
+            try:
+                res = run_cv(df, cols, clf_name, clf,
+                             n_splits=args.n_splits, seed=args.seed)
+            except Exception as e:
+                print(f"    FAILED: {e}")
+                continue
+            row = {
+                "family": fam_name, "classifier": clf_name,
+                "n_features": res["n_features"],
+                "mean_acc": res["mean_acc"],
+                "std_acc": res["std_acc"],
+                "mean_macro_f1": res["mean_macro_f1"],
+                "mean_balanced_acc": res["mean_balanced_acc"],
+            }
+            summary_rows.append(row)
+            print(f"    acc={res['mean_acc']:.3f} ± {res['std_acc']:.3f}, "
+                  f"macro F1={res['mean_macro_f1']:.3f}")
+
+            # Per-cell heatmap
+            heat = per_cell_accuracy(res["all_true"], res["all_pred"], res["all_groups"])
+            all_per_cell[(fam_name, clf_name)] = heat
+            heat.to_csv(args.output_dir / f"per_cell_{fam_name}_{clf_name}.csv")
+
+            # Confusion matrix
+            classes = sorted(set(res["all_true"]))
+            cm = confusion_matrix(res["all_true"], res["all_pred"], labels=classes)
+            cm_df = pd.DataFrame(cm, index=classes, columns=classes)
+            all_confusion[(fam_name, clf_name)] = cm_df
+            cm_df.to_csv(args.output_dir / f"confusion_{fam_name}_{clf_name}.csv")
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df = summary_df.sort_values("mean_acc", ascending=False).reset_index(drop=True)
+    summary_df.to_csv(args.output_dir / "summary.csv", index=False)
+
+    print("\n=== SUMMARY (sorted by mean accuracy) ===")
+    print(summary_df.round(4).to_string(index=False))
+
+    # Pretty-print best per-cell heatmap
+    if summary_rows:
+        best = summary_rows[0]
+        for r in summary_rows:
+            if r["mean_acc"] > best["mean_acc"]:
+                best = r
+        bf = best["family"]; bc = best["classifier"]
+        print(f"\nBest combo: {bf} + {bc}")
+        print(f"Per-cell accuracy heatmap (rows=distance_cm, cols=angle_deg):")
+        print(all_per_cell[(bf, bc)].round(2))
+        print(f"\nConfusion matrix:")
+        print(all_confusion[(bf, bc)])
+    print(f"\nSaved all results to {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()

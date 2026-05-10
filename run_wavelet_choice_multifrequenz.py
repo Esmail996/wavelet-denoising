@@ -4,9 +4,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.signal import butter, detrend, sosfiltfilt
+from scipy.signal import detrend
 
-from bandpass import bandpass
+from preprocess import bandpass
 from wavelet_choice import optimal_wavelets, wavespace
 
 
@@ -14,9 +14,9 @@ NAME_RE = re.compile(r"(?P<dist>\d+)\s*cm[_-](?P<ang>-?\d+)\s*Grad", re.IGNORECA
 
 # Fixed per-band filter configs selected from bandpass grid search.
 BANDPASS_CFG_BY_CENTER_HZ = {
-    40_000: {"method": "iir", "order": 8, "bw_hz": 4_000.0},
-    50_000: {"method": "iir", "order": 1, "bw_hz": 7_000.0},
-    60_000: {"method": "iir", "order": 1, "bw_hz": 7_000.0},
+    40_000: {"method": "iir", "order": 2, "bw_hz": 6_000.0},
+    50_000: {"method": "iir", "order": 2, "bw_hz": 6_000.0},
+    60_000: {"method": "iir", "order": 2, "bw_hz": 6_000.0},
 }
 
 
@@ -76,12 +76,21 @@ def preprocess_signal_like_preprocessing_py(
         # Bypass bandpass: apply the same detrended signal to all three band slots.
         return {nom: detrended.copy() for nom in nominal_bands}
 
-    if preprocess_mode == "bp25_75_sos1":
-        # Wideband pass (25-75 kHz) using first-order Butterworth SOS filter.
-        low = 25_000.0 / (fs_hz / 2.0)
-        high = 75_000.0 / (fs_hz / 2.0)
-        sos = butter(1, [low, high], btype="band", output="sos")
-        wide = sosfiltfilt(sos, detrended)
+    if preprocess_mode == "bp25_75":
+        # Wideband frontend:
+        # x = x - mean(x), then Butterworth SOS bandpass 25-75 kHz.
+        x_wb = np.asarray(x, dtype=np.float64)
+        x_wb = x_wb - x_wb.mean()
+        wide = bandpass(
+            x_wb,
+            fs_hz,
+            50_000.0,
+            bw=25_000.0,
+            method="iir",
+            order=iir_order,
+            numtaps=fir_numtaps,
+            window=fir_window,
+        )
         return {nom: wide.copy() for nom in nominal_bands}
 
     band_signals = {
@@ -131,11 +140,12 @@ def run_all(
     max_files: int | None = None,
     max_trials: int | None = None,
     preprocess_mode: str = "bandpass",
+    mic: str = "mic1",
 ):
-    if preprocess_mode not in ("bandpass", "raw", "bp25_75_sos1"):
+    if preprocess_mode not in ("bandpass", "raw", "bp25_75"):
         raise ValueError(
             f"Unknown preprocess_mode: {preprocess_mode!r}. "
-            "Use 'bandpass', 'raw', or 'bp25_75_sos1'."
+            "Use 'bandpass', 'raw', or 'bp25_75'."
         )
 
     wave_family = wavespace()
@@ -149,7 +159,7 @@ def run_all(
 
         dist_cm, angle_deg = parse_dist_angle(fp.name)
         obj = pd.read_pickle(fp)
-        mic2_trials = extract_mic_trials(obj, mic_col="mic2")
+        mic2_trials = extract_mic_trials(obj, mic_col=mic)
         if max_trials is not None:
             mic2_trials = mic2_trials[:max_trials]
 
@@ -165,6 +175,11 @@ def run_all(
                 preprocess_mode=preprocess_mode,
             )
 
+            # For wideband/raw all band slots are identical — only process once.
+            if preprocess_mode != "bandpass":
+                first_key = next(iter(band_signals))
+                band_signals = {first_key: band_signals[first_key]}
+
             for center_hz, sig_bp in band_signals.items():
                 if preprocess_mode == "bandpass":
                     cfg = BANDPASS_CFG_BY_CENTER_HZ[int(center_hz)]
@@ -172,16 +187,19 @@ def run_all(
                     bp_method_row = str(cfg["method"])
                     iir_order_row = int(cfg["order"])
                     bw_hz_row = float(cfg["bw_hz"])
-                elif preprocess_mode == "bp25_75_sos1":
-                    cfg_id = "sos_o1_bp25_75k"
-                    bp_method_row = "iir_sos"
-                    iir_order_row = 1
+                    band_center_hz_row = int(center_hz)
+                elif preprocess_mode == "bp25_75":
+                    cfg_id = f"{bp_method}_o{int(iir_order)}_bp25_75k"
+                    bp_method_row = str(bp_method)
+                    iir_order_row = int(iir_order)
                     bw_hz_row = 25_000.0
+                    band_center_hz_row = None
                 else:
                     cfg_id = "raw_no_bandpass"
                     bp_method_row = "none"
                     iir_order_row = 0
                     bw_hz_row = 0.0
+                    band_center_hz_row = None
 
                 # Evaluate all candidate wavelets so min_kappa filtering is exact,
                 # not limited by an early top-N truncation.
@@ -190,6 +208,17 @@ def run_all(
                     continue
 
                 best, selected_kappa, min_kappa_satisfied = pick_best_result(results, min_kappa=min_kappa)
+                top_candidates = results[: max(1, int(top_n))]
+                top_fields = {}
+                for rank in range(1, int(top_n) + 1):
+                    if rank <= len(top_candidates):
+                        candidate = top_candidates[rank - 1]
+                        top_fields[f"top{rank}_wavelet"] = str(candidate["wavelet"])
+                        top_fields[f"top{rank}_mu_sc"] = float(candidate["mu_sc"])
+                    else:
+                        top_fields[f"top{rank}_wavelet"] = ""
+                        top_fields[f"top{rank}_mu_sc"] = np.nan
+
                 rows.append(
                     {
                         "category": category,
@@ -197,8 +226,8 @@ def run_all(
                         "distance_cm": dist_cm,
                         "angle_deg": angle_deg,
                         "meas_idx": int(meas_idx),
-                        "mic": "Mic2",
-                        "band_center_hz": int(center_hz),
+                        "mic": mic.capitalize(),
+                        "band_center_hz": band_center_hz_row,
                         "best_wavelet": best["wavelet"],
                         "best_kappa_decomposition_level": int(selected_kappa),
                         "min_kappa_target": int(min_kappa),
@@ -210,6 +239,7 @@ def run_all(
                         "iir_order": int(iir_order_row),
                         "bw_hz": float(bw_hz_row),
                         "preprocess_mode": str(preprocess_mode),
+                        **top_fields,
                     }
                 )
 
@@ -301,13 +331,20 @@ def build_parser():
         help="Optional per-file trial limit for quick test runs.",
     )
     parser.add_argument(
+        "--mic",
+        type=str,
+        choices=["mic1", "mic2", "mic3"],
+        default="mic1",
+        help="Which microphone channel to process (mic1, mic2, or mic3).",
+    )
+    parser.add_argument(
         "--preprocess-mode",
         type=str,
-           choices=["bandpass", "raw", "bp25_75_sos1"],
+                choices=["bandpass", "raw", "bp25_75"],
         default="bandpass",
         help="'bandpass' (default): DC removal + detrend + bandpass per band. "
                "'raw': DC removal + detrend only, same signal fed to all band slots. "
-               "'bp25_75_sos1': first-order SOS bandpass from 25 to 75 kHz, then reused across band slots.",
+                             "'bp25_75': Butterworth SOS frontend from 25 to 75 kHz with mean removal and --iir-order.",
     )
     return parser
 
@@ -329,6 +366,10 @@ if __name__ == "__main__":
         max_files=args.max_files,
         max_trials=args.max_trials,
         preprocess_mode=str(args.preprocess_mode),
+        mic=str(args.mic),
     )
     print(f"Rows written: {len(df)}")
     print(f"CSV: {Path(args.out_csv)}")
+
+# Run command used for full Multifrequenz dataset (wideband 25-75 kHz, IIR SOS order 6):
+# python run_wavelet_choice_multifrequenz.py --data-root "Multifrequenz Dataset\Multifrequenz" --preprocess-mode bp25_75 --bp-method iir --iir-order 6 --out-csv "outputs/wavelet_choice/multifrequenz_full_bp25_75_iir_o6_mic1.csv"

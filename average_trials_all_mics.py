@@ -105,7 +105,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description=(
             "Average trial groups for Mic1/Mic2/Mic3 in each pickle file. "
-            "With 100 trials and group_size=25, each source file creates 4 averaged files."
+            "With 100 trials and group_size=10, each source file creates 10 averaged files."
         )
     )
     parser.add_argument(
@@ -117,13 +117,13 @@ def build_parser():
     parser.add_argument(
         "--out-root",
         type=str,
-        default="Multifrequenz Dataset/Multifrequenz_mean25",
+        default="Multifrequenz Dataset/Multifrequenz_mean10",
         help="Output root folder.",
     )
     parser.add_argument(
         "--group-size",
         type=int,
-        default=25,
+        default=10,
         help="Number of trials per mean group.",
     )
     return parser

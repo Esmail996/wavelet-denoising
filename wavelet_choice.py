@@ -4,8 +4,6 @@ import pandas as pd
 from pathlib import Path
 import argparse
 
-from data_loader import load_data_folder
-from parameters import BOX_DATA_DIR, OUT_DIR
 
 
 # ============================================================
@@ -453,6 +451,9 @@ def run_method_on_dataset(
     df_summary : pd.DataFrame
         Summary grouped by selected best wavelet.
     """
+    from data_loader import load_data_folder
+    from parameters import BOX_DATA_DIR, OUT_DIR
+
     mic = mic.lower()
     if mic not in {"mic1", "mic2", "mic3"}:
         raise ValueError("mic must be one of: mic1, mic2, mic3")

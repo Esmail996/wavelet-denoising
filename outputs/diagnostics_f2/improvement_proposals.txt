@@ -1,0 +1,80 @@
+========================================================================
+Classifier diagnostics — improvement proposals
+========================================================================
+
+[1] Family ranking (mean accuracy across classifiers):
+    F1_with_da                   0.670
+    F1+F15_with_da               0.669
+    F1                           0.667
+    F1+F15                       0.666
+    F1+F15+F2_full_hybrid_with_da 0.609
+    F1+F15+F2_full_hybrid        0.607
+    F1+F2_with_da                0.603
+    F1+F2                        0.599
+    F15+F2_with_da               0.549
+    F2                           0.544
+    F15+F2                       0.544
+    F2_with_da                   0.542
+    F15_with_da                  0.500
+    F15                          0.491
+
+[2] Classifier ranking (mean accuracy across families):
+    RandomForest                 0.618
+    RBF-SVM                      0.589
+    LR-L2                        0.563
+
+[3] Per-(distance, angle) accuracy heatmap (best combo):
+              -10    -5     0     5    10
+distance_cm                              
+25           0.69  0.88  0.67  0.67  0.69
+50           1.00  0.98  0.76  0.64  0.67
+75           0.89  0.99  0.71  0.71  0.36
+100          0.67  0.79  0.39  0.93  0.62
+125          0.90  0.68  0.46  0.69  0.46
+
+Weakest cells:
+    distance=75, angle=10°: 0.36
+    distance=100, angle=0°: 0.39
+    distance=125, angle=0°: 0.46
+
+[4] Aggregated confusion matrix (best combo):
+       Box  Dose  Glas
+Box   2221   210    69
+Dose   198  2263    39
+Glas  1169   454   877
+
+Dominant confusion: true Glas → predicted Box (46.8% of Glas trials)
+
+[5] Top 15 features by permutation importance (best combo):
+    Mic2_Tx8_cD1_shannon                                         +0.0071 ± 0.0012
+    Mic1_Tx5_cD1_energy                                          +0.0065 ± 0.0009
+    Mic1_Tx1_env_rise_us                                         +0.0052 ± 0.0012
+    Mic2_Tx8_cD1_kurt                                            +0.0047 ± 0.0011
+    Mic1_Tx1_cD1_peakamp                                         +0.0045 ± 0.0013
+    Mic1_Tx8_cD3_kurt                                            +0.0043 ± 0.0018
+    Mic1_Tx5_env_peakamp                                         +0.0039 ± 0.0009
+    Mic1_Tx5_cD1_logenergy                                       +0.0037 ± 0.0014
+    Mic1_Tx8_cD5_energy                                          +0.0036 ± 0.0017
+    Mic1_Tx1_env_peakamp                                         +0.0035 ± 0.0015
+    Mic1_Tx8_cD4_peakamp                                         +0.0032 ± 0.0017
+    Mic2_Tx8_cD1_sparsity                                        +0.0032 ± 0.0007
+    Mic2_Tx8_cD2_shannon                                         +0.0032 ± 0.0014
+    Mic1_Tx8_cD3_logenergy                                       +0.0032 ± 0.0008
+    Mic1_Tx8_cD3_shannon                                         +0.0031 ± 0.0010
+
+Family share of top-20 features: {'F1': 20, 'F15': 0, 'F2': 0}
+
+[6] Distance/angle as features: avg accuracy +0.003 when added.
+    (Difference small — features generalise well across distance/angle.)
+
+========================================================================
+Improvement proposals (ranked by expected impact)
+========================================================================
+
+[1] (priority 10/10) Family 'F15' lags 'F1_with_da' by 18.0%. Drop or reweight features in F15 that don't survive into the hybrid.
+
+[2] (priority 9/10) Cell (distance=75, angle=10°) accuracy = 0.36. Inspect ROI alignment + SNR there. Consider a per-distance feature normalisation or a bespoke classifier for that range.
+
+[3] (priority 8/10) Glas is misclassified as Box on 47% of trials. Engineer a feature that discriminates these two materials specifically — e.g. cepstral coefficients capturing surface roughness, or per-Tx amplitude ratios that probe frequency-dependent absorption.
+
+[4] (priority 7/10) Top features are dominated by F1. Consider reducing the other families or applying within-family feature selection (mutual information, recursive feature elimination).

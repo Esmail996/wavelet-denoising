@@ -1,3 +1,21 @@
+# -------------------------------------------------------
+# Project-specific exclusions
+# -------------------------------------------------------
+
+# Raw dataset (large binary pickles — not tracked in git)
+Multifrequenz Dataset/
+
+# Virtual environments
+venv/
+.venv/
+
+# Large feature matrices (>100 MB — rejected by GitHub)
+outputs/features/features_all_f2.csv
+outputs/features/features_improved_with_f2.csv
+outputs/bandpass_grid_search_mic2_pertrial_pareto/pilot_iir_grid_trials.csv
+outputs/bandpass_grid_search_mic2_pertrial_pareto_near/pilot_iir_grid_trials.csv
+
+# -------------------------------------------------------
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

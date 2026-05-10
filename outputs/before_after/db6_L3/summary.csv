@@ -1,0 +1,17 @@
+signal,wavelet,level,method,thr_mode,std_raw,std_den,std_reduction_pct,plot
+40k_decimated,db6,3,energy,hard,64.46236619545417,60.771896643815786,5.724998583590047,outputs/before_after/db6_L3/40k_decimated__energy__hard.png
+40k_decimated,db6,3,universal,hard,64.46236619545417,64.45928606048213,0.004778190987744023,outputs/before_after/db6_L3/40k_decimated__universal__hard.png
+40k_decimated,db6,3,stein,hard,64.46236619545417,64.46169425636577,0.0010423742224326955,outputs/before_after/db6_L3/40k_decimated__stein__hard.png
+40k_decimated,db6,3,heurstein,hard,64.46236619545417,64.46169425636577,0.0010423742224326955,outputs/before_after/db6_L3/40k_decimated__heurstein__hard.png
+50k_decimated,db6,3,energy,hard,68.28131917227104,65.39652079979413,4.224872054974036,outputs/before_after/db6_L3/50k_decimated__energy__hard.png
+50k_decimated,db6,3,universal,hard,68.28131917227104,68.26679060130179,0.02127751945241759,outputs/before_after/db6_L3/50k_decimated__universal__hard.png
+50k_decimated,db6,3,stein,hard,68.28131917227104,68.28104679583481,0.00039890330112323695,outputs/before_after/db6_L3/50k_decimated__stein__hard.png
+50k_decimated,db6,3,heurstein,hard,68.28131917227104,68.28104679583481,0.00039890330112323695,outputs/before_after/db6_L3/50k_decimated__heurstein__hard.png
+60k_decimated,db6,3,energy,hard,77.1641936087777,72.82018454395815,5.629565814999198,outputs/before_after/db6_L3/60k_decimated__energy__hard.png
+60k_decimated,db6,3,universal,hard,77.1641936087777,77.16045252601727,0.004848210789832002,outputs/before_after/db6_L3/60k_decimated__universal__hard.png
+60k_decimated,db6,3,stein,hard,77.1641936087777,77.16405793342854,0.00017582682175653385,outputs/before_after/db6_L3/60k_decimated__stein__hard.png
+60k_decimated,db6,3,heurstein,hard,77.1641936087777,77.16405793342854,0.00017582682175653385,outputs/before_after/db6_L3/60k_decimated__heurstein__hard.png
+original,db6,3,energy,hard,314.1107979687199,299.19627033626784,4.748174124831358,outputs/before_after/db6_L3/original__energy__hard.png
+original,db6,3,universal,hard,314.1107979687199,314.0420867625138,0.021874830999265977,outputs/before_after/db6_L3/original__universal__hard.png
+original,db6,3,stein,hard,314.1107979687199,314.0581370082727,0.016765090785722348,outputs/before_after/db6_L3/original__stein__hard.png
+original,db6,3,heurstein,hard,314.1107979687199,314.0581370082727,0.016765090785722348,outputs/before_after/db6_L3/original__heurstein__hard.png

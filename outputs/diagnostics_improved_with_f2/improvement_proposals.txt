@@ -1,0 +1,66 @@
+========================================================================
+Classifier diagnostics — improvement proposals
+========================================================================
+
+[1] Family ranking (mean accuracy across classifiers):
+    F1+F15                       0.904
+    F1                           0.904
+    F1+F2                        0.879
+    F1+F15+F2_full_hybrid        0.877
+    F15+F2                       0.692
+    F2                           0.686
+    F15                          0.551
+
+[2] Classifier ranking (mean accuracy across families):
+    LR-L2                        0.799
+    RandomForest                 0.784
+    RBF-SVM                      0.771
+
+[3] Per-(distance, angle) accuracy heatmap (best combo):
+              -10    -5     0     5    10
+distance_cm                              
+25           0.53  0.65  0.67  0.71  1.00
+50           1.00  1.00  0.98  0.99  1.00
+75           1.00  1.00  0.99  0.98  0.87
+100          1.00  1.00  0.96  1.00  0.87
+125          1.00  1.00  1.00  1.00  1.00
+
+Weakest cells:
+    distance=25, angle=-10°: 0.53
+    distance=25, angle=-5°: 0.65
+    distance=25, angle=0°: 0.67
+
+[4] Aggregated confusion matrix (best combo):
+       Box  Dose  Glas
+Box   2499     0     1
+Dose    41  2404    55
+Glas   394    52  2054
+
+Dominant confusion: true Glas → predicted Box (15.8% of Glas trials)
+
+[5] Top 15 features by permutation importance (best combo):
+    ws_Mic2_gap_23                                               +0.0108 ± 0.0014
+    ws_Mic2_top2_mu_sc                                           +0.0072 ± 0.0009
+    Mic2_Tx1_cA1_shannon                                         +0.0055 ± 0.0023
+    Mic2_Tx8_carrier_band_frac                                   +0.0047 ± 0.0004
+    Mic1_Tx1_cD1_shannon                                         +0.0033 ± 0.0008
+    Mic1_Tx8_carrier_band_frac                                   +0.0029 ± 0.0016
+    Mic2_Tx1_cD1_kurt                                            +0.0028 ± 0.0021
+    Mic2_Tx1_cA1_sparsity                                        +0.0027 ± 0.0009
+    Mic2_Tx8_env_kurt                                            +0.0027 ± 0.0013
+    Mic2_Tx1_cA1_kurt                                            +0.0024 ± 0.0011
+    Mic1_Tx1_cD1_kurt                                            +0.0024 ± 0.0005
+    Mic2_Tx1_cD1_peakamp                                         +0.0020 ± 0.0011
+    Mic1_Tx1_cD1_sparsity                                        +0.0017 ± 0.0003
+    Mic1_Tx8_env_rise_us                                         +0.0015 ± 0.0009
+    ws_Mic1_gap_23                                               +0.0013 ± 0.0006
+
+Family share of top-20 features: {'F1': 20, 'F15': 0, 'F2': 0}
+
+========================================================================
+Improvement proposals (ranked by expected impact)
+========================================================================
+
+[1] (priority 10/10) Family 'F15' lags 'F1+F15' by 35.4%. Drop or reweight features in F15 that don't survive into the hybrid.
+
+[2] (priority 7/10) Top features are dominated by F1. Consider reducing the other families or applying within-family feature selection (mutual information, recursive feature elimination).
