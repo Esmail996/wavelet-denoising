@@ -92,6 +92,19 @@ def compute_permutation_importance(
         clf = RandomForestClassifier(n_estimators=300, random_state=0, n_jobs=-1)
     elif clf_name == "RBF-SVM":
         clf = Pipeline([("scaler", StandardScaler()), ("clf", SVC(C=10.0, gamma="scale", random_state=0))])
+    elif clf_name == "LightGBM":
+        try:
+            from lightgbm import LGBMClassifier
+        except ImportError as e:
+            raise ValueError("clf LightGBM requested for diagnostics but lightgbm is not installed") from e
+        clf = LGBMClassifier(
+            n_estimators=400,
+            num_leaves=63,
+            learning_rate=0.05,
+            n_jobs=-1,
+            random_state=0,
+            verbosity=-1,
+        )
     else:
         raise ValueError(f"clf {clf_name} not supported for diagnostics")
 
@@ -238,8 +251,8 @@ def main() -> None:
     summary = load_summary(args.classification_dir)
     print(f"\nSummary table:\n{summary.round(3).to_string(index=False)}")
     best = summary.iloc[0]
-    print(f"\nBest combo: {best['family']} + {best['classifier']} → "
-          f"{best['mean_acc']:.3f} ± {best['std_acc']:.3f}")
+    print(f"\nBest combo: {best['family']} + {best['classifier']} -> "
+          f"{best['mean_acc']:.3f} +/- {best['std_acc']:.3f}")
 
     per_cell = load_per_cell(args.classification_dir, best["family"], best["classifier"])
     confusion = load_confusion(args.classification_dir, best["family"], best["classifier"])

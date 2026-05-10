@@ -38,7 +38,8 @@ from __future__ import annotations
 
 import numpy as np
 from typing import Sequence
-from scipy.signal import hilbert, butter, sosfiltfilt
+# CHANGE (post-92.76% baseline): added find_peaks — required by _tail_features (Group 1, added later)
+from scipy.signal import hilbert, butter, sosfiltfilt, find_peaks
 from scipy.stats import kurtosis as scipy_kurtosis, skew as scipy_skew
 
 from roi_preprocessing import preprocess_roi
@@ -210,6 +211,99 @@ def _envelope_features(x: np.ndarray, fs: float) -> dict[str, float]:
     }
 
 
+# CHANGE (post-92.76% baseline): entire _tail_features function is NEW.
+# Motivation: Glas misclassified as Box on ~47% of trials in classification_f2.
+# Hypothesis: Glas has longer ringdown / secondary reflections; Box echo decays
+# faster and more cleanly. These 3 features probe exactly that:
+#   - late_to_peak_ratio : how much energy remains 50-250 us after the main peak
+#   - n_envelope_peaks   : count of secondary echo bumps (reverb structure)
+#   - decay_slope_db_us  : dB/us slope of the envelope after peak (steep = fast decay)
+# Result (v3/v4/v5): feature added correctly but Glas->Box error unchanged at 394.
+# Net accuracy with this block: 92.4-92.76% (no regression, no improvement on Glas).
+def _tail_features(x: np.ndarray, fs: float, eps: float = 1e-12) -> dict[str, float]:
+    """Tail-shape features targeted at Glas-vs-Box discrimination.
+
+    Features:
+      - late_to_peak_ratio: E[peak+50us : peak+250us] / E[peak-25us : peak+25us]
+      - n_envelope_peaks: count of secondary envelope peaks >=25% main peak
+                          in [peak-300us : peak+300us]
+      - decay_slope_db_us: linear slope of 20*log10(envelope) in [peak : peak+150us]
+    """
+    x = np.asarray(x, dtype=np.float64)
+    # Validate: no NaN/inf, has sufficient length, non-zero energy
+    if len(x) < 8 or not np.isfinite(x).all():
+        return {
+            "late_to_peak_ratio": 0.0,
+            "n_envelope_peaks": 0.0,
+            "decay_slope_db_us": 0.0,
+        }
+    
+    # Compute envelope safely
+    try:
+        env = np.abs(hilbert(x))
+    except (ValueError, RuntimeError, TypeError):
+        # If Hilbert fails (e.g., all zeros), return zeros
+        return {
+            "late_to_peak_ratio": 0.0,
+            "n_envelope_peaks": 0.0,
+            "decay_slope_db_us": 0.0,
+        }
+    
+    n = len(env)
+    if float(env.max()) < eps:
+        return {
+            "late_to_peak_ratio": 0.0,
+            "n_envelope_peaks": 0.0,
+            "decay_slope_db_us": 0.0,
+        }
+
+    peak_idx = int(np.argmax(env))
+    peak_amp = float(env[peak_idx])
+
+    def _us_to_samp(us: float) -> int:
+        return int(round(us * 1e-6 * fs))
+
+    # Main-echo energy around peak (+/-25 us)
+    main_lo = max(0, peak_idx - _us_to_samp(25.0))
+    main_hi = min(n, peak_idx + _us_to_samp(25.0) + 1)
+    main_e = float(np.sum(env[main_lo:main_hi] ** 2))
+
+    # Late-tail energy (peak+50 us to peak+250 us)
+    late_lo = max(0, peak_idx + _us_to_samp(50.0))
+    late_hi = min(n, peak_idx + _us_to_samp(250.0) + 1)
+    late_e = float(np.sum(env[late_lo:late_hi] ** 2)) if late_hi > late_lo else 0.0
+    late_to_peak_ratio = float(late_e / (main_e + eps))
+
+    # Count secondary envelope peaks >= 25% main peak around +/-300 us
+    search_lo = max(0, peak_idx - _us_to_samp(300.0))
+    search_hi = min(n, peak_idx + _us_to_samp(300.0) + 1)
+    if search_hi - search_lo >= 3:
+        local = env[search_lo:search_hi]
+        peaks, _ = find_peaks(local, height=0.25 * peak_amp)
+        peaks_abs = peaks + search_lo
+        # Exclude the main peak itself to measure secondary structure
+        n_secondary = int(np.sum(peaks_abs != peak_idx))
+    else:
+        n_secondary = 0
+
+    # Decay slope in dB/us from peak to peak+150 us
+    dec_lo = peak_idx
+    dec_hi = min(n, peak_idx + _us_to_samp(150.0) + 1)
+    if dec_hi - dec_lo >= 3:
+        y = 20.0 * np.log10(env[dec_lo:dec_hi] + eps)
+        x_us = (np.arange(dec_lo, dec_hi) - peak_idx) / fs * 1e6
+        slope, _ = np.polyfit(x_us, y, 1)
+        decay_slope_db_us = float(slope)
+    else:
+        decay_slope_db_us = 0.0
+
+    return {
+        "late_to_peak_ratio": late_to_peak_ratio,
+        "n_envelope_peaks": float(n_secondary),
+        "decay_slope_db_us": decay_slope_db_us,
+    }
+
+
 # -----------------------------------------------------------------
 # Spectral features
 # -----------------------------------------------------------------
@@ -267,8 +361,12 @@ def extract_family1_features(
     carrier_hz: float,
     swt_levels: int = 5,
     swt_wavelet: str = "sym6",
+    # CHANGE (post-92.76% baseline): include_tail flag added so the per-trial
+    # driver can call this function without tail features when it will merge
+    # tail features computed on a separate (raw) ROI via Option 2.
+    include_tail: bool = True,
 ) -> dict[str, float]:
-    """Extract ~55 features from one ROI signal.
+    """Extract Family 1 features from one ROI signal.
 
     Parameters
     ----------
@@ -277,6 +375,8 @@ def extract_family1_features(
     carrier_hz : nominal carrier of the Tx generating this echo (40k/50k/60k)
     swt_levels : SWT decomposition depth
     swt_wavelet : pywt wavelet name (sym6 default to match pipeline)
+    include_tail : if True, include tail morphology features (Group 1);
+                   if False, omit them (for use when computing separately on raw ROI)
 
     Returns
     -------
@@ -288,6 +388,11 @@ def extract_family1_features(
     out.update(_swt_subband_features(coeffs))
     out.update(_envelope_features(x, fs))
     out.update(_spectral_features(x, fs, carrier_hz))
+    # CHANGE (post-92.76% baseline): tail features only appended when include_tail=True.
+    # When tail_realign=False in the per-trial driver, this is called with
+    # include_tail=False and tail features are merged separately from the raw ROI.
+    if include_tail:
+        out.update(_tail_features(x, fs))
     return out
 
 
@@ -306,6 +411,11 @@ def extract_family1_for_trial(
     txs: Sequence[str] = ("Tx1", "Tx5", "Tx8"),
     realign: bool = True,
     normalise: bool = True,
+    # CHANGE (post-92.76% baseline): tail_realign parameter added for Option 2
+    # experiment. Default False = tail computed on raw TOF-anchored ROI (Option 2).
+    # True = tail computed on the same realigned ROI as all other features (Option 1).
+    # Tested in v5; result: Glas->Box stayed at 394 regardless of this flag.
+    tail_realign: bool = False,
 ) -> dict[str, float]:
     """For one trial, extract Family 1 features per (Mic, Tx) channel and
     concatenate with channel-prefixed names.
@@ -318,8 +428,15 @@ def extract_family1_for_trial(
     feature extraction (eliminates residual TOF mis-alignment).
     If `normalise`, each ROI is divided by its RMS energy (removes the
     1/R² distance amplitude effect; features encode SHAPE only).
+
+    If `tail_realign=False`, Group 1 tail morphology features are computed
+    on the raw (unrealigned) TOF-anchored ROI. This preserves box-specific
+    tail structure that may be smoothed by realign-to-peak preprocessing.
+    All other features use the realigned ROI.
     """
     out = {}
+    channel_summary: dict[tuple[str, str], dict[str, float]] = {}
+    channel_tail_feats: dict[tuple[str, str], dict[str, float]] = {}
     n_samp = len(next(iter(trial_signals.values())))
     half_samp = int(roi_half_us * 1e-6 * fs)
     tx_half_bw_hz = tx_half_bw_hz or {}
@@ -339,11 +456,63 @@ def extract_family1_for_trial(
             lo = max(0, centre - half_samp)
             hi = min(n_samp, centre + half_samp)
             roi = sig[lo:hi]
-            # Apply preprocessing
-            roi = preprocess_roi(roi, realign=realign, normalise=normalise)
-            feats = extract_family1_features(roi, fs=fs, carrier_hz=fc)
+
+            # CHANGE (post-92.76% baseline): Option 2 branch.
+            # When tail_realign=False (default), tail features are extracted here
+            # from the raw bandpass-filtered, TOF-windowed ROI BEFORE realignment.
+            # This preserves absolute timing and amplitude context of the tail.
+            # **OPTION 2**: Compute tail features on raw (non-realigned) ROI
+            if not tail_realign:
+                tail_feats = _tail_features(roi, fs)
+                channel_tail_feats[(mic, tx)] = tail_feats
+
+            # Apply preprocessing (realign + normalise) for all other features
+            roi_processed = preprocess_roi(roi, realign=realign, normalise=normalise)
+            # CHANGE (post-92.76% baseline): include_tail=tail_realign so that when
+            # Option 2 is active (tail_realign=False) the tail is NOT recomputed here.
+            feats = extract_family1_features(roi_processed, fs=fs, carrier_hz=fc,
+                                             include_tail=tail_realign)
+            channel_summary[(mic, tx)] = {
+                "env_peaktime_us": float(feats.get("env_peaktime_us", 0.0)),
+                "centroid_hz": float(feats.get("centroid_hz", 0.0)),
+            }
             for k, v in feats.items():
                 out[f"{mic}_{tx}_{k}"] = v
+
+            # CHANGE (post-92.76% baseline): merge raw-ROI tail features into
+            # the output dict, overwriting any tail keys from the preprocessed path.
+            # Merge tail features computed on raw ROI (if tail_realign=False)
+            if not tail_realign:
+                for k, v in tail_feats.items():
+                    out[f"{mic}_{tx}_{k}"] = v
+
+    # CHANGE (post-92.76% baseline): entire Group 2 block is NEW.
+    # Adds cross-mic timing and frequency centroid offsets per Tx.
+    # Hypothesis: off-axis material response is angle-asymmetric; the difference
+    # between Mic1 and Mic2 arrival times / spectral centroids encodes geometry
+    # that helps disambiguate Glas (more specular, angle-sensitive) from Box.
+    # Net effect on 92.76% run: included by default; did not close Glas->Box gap.
+    # Group 2: cross-mic off-axis signatures per Tx
+    if len(mics) >= 2:
+        if "Mic1" in mics and "Mic2" in mics:
+            m_a, m_b = "Mic1", "Mic2"
+        else:
+            m_a, m_b = mics[0], mics[1]
+
+        for tx in txs:
+            a = channel_summary.get((m_a, tx))
+            b = channel_summary.get((m_b, tx))
+            if a is None or b is None:
+                continue
+            # CHANGE (post-92.76% baseline): these two cross-mic delta features
+            # are new additions (Group 2). They did not exist in the original
+            # baseline feature set that achieved 93.3%.
+            out[f"peak_time_offset_M1_vs_M2_{tx}_us"] = (
+                a["env_peaktime_us"] - b["env_peaktime_us"]
+            )
+            out[f"freq_centroid_shift_M1_vs_M2_{tx}_hz"] = (
+                a["centroid_hz"] - b["centroid_hz"]
+            )
     return out
 
 

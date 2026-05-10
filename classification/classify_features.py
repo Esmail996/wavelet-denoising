@@ -107,6 +107,13 @@ def make_classifiers(class_weight="balanced"):
 
 
 def evaluate_fold(clf, X_train, y_train, X_test, y_test):
+    # Ensure X_train and X_test have feature names (convert numpy to DataFrame if needed)
+    # This prevents LightGBMClassifier warnings about missing feature names
+    if isinstance(X_train, np.ndarray):
+        X_train = pd.DataFrame(X_train, columns=[f"f{i}" for i in range(X_train.shape[1])])
+    if isinstance(X_test, np.ndarray):
+        X_test = pd.DataFrame(X_test, columns=[f"f{i}" for i in range(X_test.shape[1])])
+    
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
     return {
