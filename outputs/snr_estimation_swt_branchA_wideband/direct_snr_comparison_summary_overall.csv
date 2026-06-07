@@ -1,2 +1,0 @@
-band_center_hz,snr_db_raw_mean,snr_db_raw_median,snr_db_raw_std,snr_db_denoised_mean,snr_db_denoised_median,snr_db_denoised_std,snr_improvement_db_mean,snr_improvement_db_median,snr_improvement_db_std
-50000,11.961449414911028,12.606960735087853,4.811872476953946,11.962163266901028,12.607701188798673,4.812671665034678,0.0007138519899994328,0.0007584283535888581,0.002161248022677533

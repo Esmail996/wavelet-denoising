@@ -157,3 +157,9 @@ cython_debug/
 
 # Large datasets
 Multifrequenz Dataset/
+
+# Generated experiment artifacts (large and reproducible)
+outputs/
+*.csv
+*.zip
+*.npz

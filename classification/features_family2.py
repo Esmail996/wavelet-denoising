@@ -1,258 +1,170 @@
-"""
-features_family2.py — Family 2 Wavelet Scattering Transform features.
+"""features_family2.py — wavelet-scattering features on the carrier-band ROI.
 
-Production version uses Kymatio (CPU/GPU). A simplified numpy fallback is
-provided for sandbox verification. Both produce log(1 + |·|)-compressed
-scattering coefficients suitable for downstream classifiers.
+Family 2 keeps the SAME two structural controls as features_family.py, realised
+differently because scattering is broadband by construction:
 
-PRODUCTION USAGE (your machine, with kymatio installed):
-    pip install kymatio
+  (1) TIME control — the scattering is computed on the SAME fixed ROI window
+      [peak - WIN_BEFORE, peak + WIN_AFTER] about the per-trial TOF peak.
+  (2) SPECTRAL control — a sharp ZERO-PHASE band-pass (Butterworth, order
+      `BP_ORDER`, applied with `sosfiltfilt`) restricts the signal to the
+      carrier band BAND = 35-65 kHz BEFORE scattering. Being zero-phase, it adds
+      no group delay and does not move or skew the echo inside the window, so the
+      scattering shape stays faithful. The filter is applied to the whole trace
+      and the ROI is then cut out, so there are no edge transients in the window.
 
-    from features_family2 import build_scattering, extract_family2_for_trial
+The scattering transform itself (kymatio Scattering1D, complex Morlet) gives a
+time-shift-stable description: first order ~ the carrier-band envelope (as the
+CWT block of Family 1/3 does), second order ~ the amplitude modulations within
+the band that a single CWT scale cannot see. Coefficients are averaged over the
+(short) ROI; orders 1 and 2 are divided by the order-0 term so the descriptor is
+amplitude/distance-robust and encodes shape. order-0 is kept separately and is
+the only amplitude (range-dependent) term.
 
-    scattering = build_scattering(N=1024, J=8, Q=8)   # build once
-
-    # For each trial, pass the dict of (Mic, Tx) ROI arrays of length N
-    feats = extract_family2_for_trial(rois, scattering)
-
-The scattering operator is order-2 by default, returning S0, S1, S2 paths.
-With N=1024, J=8, Q=8 this typically gives ~150–250 paths per channel,
-times 6 channels = 900–1500 features per trial. That matches the V3-deck plan.
-
-Key parameters:
-    N : ROI length in samples (must be power of 2; we pad to 1024 by default)
-    J : maximum scale (2^J samples). With fs=2 MHz and N=1024, J=8 covers
-        the full ROI.
-    Q : wavelets per octave; Q=8 gives high frequency resolution at low scales,
-        important for the carrier-band content.
-
-The output is log(1 + |coefficients|) (standard scattering normalisation),
-which compresses dynamic range and makes features approximately Gaussian
-for downstream classifiers.
+One vector per (Mic, trial). No Cohen's d, no leakage flagging here.
 """
 
 from __future__ import annotations
-
-import numpy as np
+from collections import OrderedDict
 from typing import Sequence
+import numpy as np
 from scipy.signal import butter, sosfiltfilt
 
-from roi_preprocessing import preprocess_roi
+def _import_scattering1d():
+    """Return the kymatio Scattering1D class, importing it robustly.
 
-
-# =================================================================
-# Production path: Kymatio
-# =================================================================
-
-def build_scattering(N: int = 1024, J: int = 8, Q: int = 8, T=None):
-    """Build a Kymatio Scattering1D object.
-
-    Parameters
-    ----------
-    N : signal length (samples). Must be ≥ 2^J. 1024 is a good default.
-    J : maximum scale (output averaging is 2^J).
-    Q : wavelets per octave (Q1=Q for first order, Q2=1 default).
-
-    Returns
-    -------
-    Kymatio Scattering1D object that you call as `S(x)` on a 1D numpy array.
-    """
+    `from kymatio.numpy import Scattering1D` breaks on current SciPy (it pulls in
+    the 3D frontend, which imports the removed `scipy.special.sph_harm`). The 1D
+    frontend can be imported directly, which is what we use."""
     try:
         from kymatio.numpy import Scattering1D
+        return Scattering1D
     except Exception:
-        # New SciPy versions may break kymatio.numpy due to optional 3D imports.
-        # Import the 1D frontend directly as a compatible fallback.
-        try:
-            from kymatio.scattering1d.frontend.numpy_frontend import ScatteringNumPy1D as Scattering1D
-        except Exception as e:
-            raise ImportError(
-                "kymatio Scattering1D is unavailable. Install/update compatible kymatio and scipy."
-            ) from e
-
-    kwargs = {"J": J, "shape": (N,), "Q": Q}
-    if T is not None:
-        kwargs["T"] = T
-    S = Scattering1D(**kwargs)
-    return S
+        from kymatio.scattering1d.frontend.numpy_frontend import ScatteringNumPy1D
+        return ScatteringNumPy1D
 
 
-def extract_family2_features_kymatio(
-    roi: np.ndarray,
-    scattering,
-    pad_to: int = 1024,
-    log_eps: float = 1e-6,
-) -> np.ndarray:
-    """Compute scattering coefficients on one ROI signal.
+try:
+    _SCATTERING1D = _import_scattering1d()
+    _HAVE_KYMATIO = True
+except Exception:
+    _SCATTERING1D = None
+    _HAVE_KYMATIO = False
 
-    Returns a 1D numpy array of feature values (log-compressed scattering
-    coefficients, time-averaged).
+FS_DEFAULT = 2_000_000.0
+BAND = (35_000.0, 65_000.0)    # sharp carrier-band gate (covers 40/50/60 kHz)
+BP_ORDER = 8                   # zero-phase via sosfiltfilt -> ~order 16, steep, no phase distortion
+WIN_BEFORE, WIN_AFTER = 256, 768            # ROI; before+after = 1024 = 2**10
+SCAT_J = 8                     # scattering depth (carriers ~ octave 5 at fs=2 MHz)
+SCAT_Q = 8                     # wavelets/octave (resolves 40/50/60 within the band)
+
+_SCAT_CACHE: dict[tuple, "Scattering1D"] = {}
+
+
+def _bandpass(x, fs, band=BAND, order=BP_ORDER):
+    """Zero-phase Butterworth band-pass. Maximally flat passband (no ripple), so
+    the echo magnitude shape in the window is preserved; sosfiltfilt removes the
+    group delay so the echo does not shift."""
+    sos = butter(order, [band[0], band[1]], btype="band", fs=fs, output="sos")
+    return sosfiltfilt(sos, np.asarray(x, dtype=np.float64))
+
+
+def _get_scattering(T, J=SCAT_J, Q=SCAT_Q):
+    key = (int(T), int(J), int(Q))
+    if key not in _SCAT_CACHE:
+        if not _HAVE_KYMATIO:
+            raise ImportError("kymatio is required for features_family2 (pip install kymatio)")
+        _SCAT_CACHE[key] = _SCATTERING1D(J=J, shape=(int(T),), Q=Q)
+    return _SCAT_CACHE[key]
+
+
+def extract_features2(
+    waveform: np.ndarray,
+    fs: float = FS_DEFAULT,
+    window: tuple[int, int] | None = None,
+    peak: int | None = None,
+    before: int = WIN_BEFORE,
+    after: int = WIN_AFTER,
+    band=BAND,
+    J: int = SCAT_J,
+    Q: int = SCAT_Q,
+) -> "OrderedDict[str, float]":
+    """One (Mic, trial) waveform -> scattering feature dict on the band-passed ROI.
+
+    Pass `peak` (per-trial TOF sample); the window is [peak-before, peak+after].
+    The band-pass is applied to the whole trace first, then the window is cut, so
+    the window length T = before + after is fixed (1024 by default) and there are
+    no filter edge transients inside it.
     """
-    x = np.asarray(roi, dtype=np.float32)
-    n = len(x)
-    if n < pad_to:
-        x_pad = np.zeros(pad_to, dtype=np.float32)
-        start = (pad_to - n) // 2
-        x_pad[start:start + n] = x
-        x = x_pad
-    elif n > pad_to:
-        # crop centrally
-        start = (n - pad_to) // 2
-        x = x[start:start + pad_to]
-    Sx = scattering(x)             # shape (n_paths, T)
-    # Average over time → one value per scattering path
-    Sx_mean = Sx.mean(axis=-1)
-    # Log compression
-    return np.log(np.abs(Sx_mean) + log_eps).astype(np.float32)
+    x = np.asarray(waveform, dtype=np.float64).ravel()
+    n = x.size
+    if peak is not None:
+        window = (int(peak) - before, int(peak) + after)
+    lo, hi = (0, n) if window is None else (max(0, int(window[0])), min(n, int(window[1])))
+
+    xb = _bandpass(x, fs, band)
+    seg = xb[lo:hi]
+    T = before + after if peak is not None else (hi - lo)
+    # enforce the fixed length T (zero-pad if a window ran past the trace edge)
+    if seg.size < T:
+        seg = np.concatenate([seg, np.zeros(T - seg.size)])
+    elif seg.size > T:
+        seg = seg[:T]
+
+    S = _get_scattering(T, J, Q)
+    Sx = S(seg)                                   # (n_coeffs, t_out)
+    meta = S.meta()
+    order = np.asarray(meta["order"]).ravel()
+    coeff = Sx.mean(axis=-1)                       # time-average over the ROI
+
+    f = OrderedDict()
+    s0 = float(coeff[order == 0][0]) if np.any(order == 0) else float(coeff[0])
+    f["ff2_s0"] = s0                               # order-0 (amplitude / range term)
+    denom = abs(s0) + 1e-12
+    i1 = 0
+    for j, o in enumerate(order):
+        if o == 1:
+            f[f"ff2_s1_{i1:02d}"] = float(coeff[j] / denom)   # 1st order / s0 (shape)
+            i1 += 1
+    i2 = 0
+    for j, o in enumerate(order):
+        if o == 2:
+            f[f"ff2_s2_{i2:02d}"] = float(coeff[j] / denom)   # 2nd order / s0 (modulation shape)
+            i2 += 1
+    return f
 
 
-# =================================================================
-# Sandbox fallback: simplified numpy scattering
-# =================================================================
-
-def _morlet_filter(N: int, sigma: float, xi: float) -> np.ndarray:
-    """Morlet wavelet of length N centred at xi (Hz / sample) with bandwidth σ."""
-    t = np.arange(N) - N // 2
-    psi = np.exp(1j * 2 * np.pi * xi * t / N) * np.exp(-(t**2) / (2 * (sigma * N)**2))
-    psi = psi - psi.mean()
-    return psi.astype(np.complex64)
-
-
-def _build_filter_bank_simple(N: int, J: int, Q: int) -> list[np.ndarray]:
-    """A simple Morlet filter bank in the frequency domain. Not bit-identical
-    to Kymatio's filter bank — for sandbox verification only."""
-    filters = []
-    for j in range(J * Q):
-        scale = 2 ** (j / Q)
-        xi = 0.4 / scale
-        sigma = 0.1 * scale
-        psi = _morlet_filter(N, sigma, xi * N)
-        filters.append(np.fft.fft(psi))
-    return filters
-
-
-def extract_family2_features_numpy(
-    roi: np.ndarray,
-    N: int = 1024,
-    J: int = 4,
-    Q: int = 4,
-    log_eps: float = 1e-6,
-) -> np.ndarray:
-    """Simplified order-2 scattering in pure numpy. Use Kymatio in production.
-
-    Steps:
-      1. Pad ROI to N
-      2. FFT → multiply by each |psi_lambda|² → IFFT → |·| → time-avg → S1
-      3. For each S1 channel: same operation again → S2
-      4. log(1 + |·|) compression
-    """
-    x = np.asarray(roi, dtype=np.float32)
-    n = len(x)
-    if n < N:
-        xp = np.zeros(N, dtype=np.float32)
-        xp[(N - n) // 2:(N - n) // 2 + n] = x
-        x = xp
-    elif n > N:
-        start = (n - N) // 2
-        x = x[start:start + N]
-    filters = _build_filter_bank_simple(N, J, Q)
-    X = np.fft.fft(x)
-    # Order 0: just the average
-    S0 = np.abs(x.mean())
-    # Order 1: |x * psi_lambda1|, time-averaged
-    S1_paths = []
-    U1_signals = []
-    for psi in filters:
-        U1 = np.abs(np.fft.ifft(X * psi))
-        U1_signals.append(U1)
-        S1_paths.append(U1.mean())
-    # Order 2: |U1_lambda1 * psi_lambda2| time-averaged, only when lambda2<lambda1
-    S2_paths = []
-    for i, U1 in enumerate(U1_signals):
-        U1_fft = np.fft.fft(U1)
-        for j in range(i + 1, len(filters)):
-            U2 = np.abs(np.fft.ifft(U1_fft * filters[j]))
-            S2_paths.append(U2.mean())
-    feats = np.concatenate([[S0], S1_paths, S2_paths]).astype(np.float32)
-    return np.log(np.abs(feats) + log_eps)
-
-
-# =================================================================
-# Per-trial driver
-# =================================================================
-
-def extract_family2_for_trial(
+def extract_features2_for_trial(
     trial_signals: dict[str, np.ndarray],
-    tof_per_pair_s: dict[tuple[str, str], float],
-    fs: float,
-    carrier_per_tx: dict[str, float],
-    tx_half_bw_hz: dict[str, float] | None = None,
-    scattering=None,
-    roi_n: int = 1024,
-    mics: Sequence[str] = ("Mic1", "Mic2"),
-    txs: Sequence[str] = ("Tx1", "Tx5", "Tx8"),
-    use_kymatio: bool = True,
-    realign: bool = True,
-    normalise: bool = True,
-) -> dict[str, float]:
-    """Extract Family-2 scattering features for all (Mic, Tx) channels of one trial.
-
-    The ROI is centred on the corrected TOF arrival, length roi_n samples
-    (default 1024 = 512 µs at 2 MHz).
-
-    If `realign`, each ROI is re-centred on its envelope peak before
-    scattering. If `normalise`, ROI is divided by RMS energy.
-    """
-    out = {}
-    half = roi_n // 2
-    tx_half_bw_hz = tx_half_bw_hz or {}
-    for mic in mics:
-        sig_full = np.asarray(trial_signals[mic], dtype=np.float64)
-        for tx in txs:
-            tof = tof_per_pair_s[(mic, tx)]
-            fc = carrier_per_tx[tx]
-            half_bw = float(tx_half_bw_hz.get(tx, 3000.0))
-            sos = butter(4, [fc - half_bw, fc + half_bw], btype="band",
-                         fs=fs, output="sos")
-            sig = sosfiltfilt(sos, sig_full).astype(np.float32)
-            centre = int(round(tof * fs))
-            lo = max(0, centre - half)
-            hi = min(len(sig), lo + roi_n)
-            lo = hi - roi_n   # back-fill if at end
-            if lo < 0:
-                roi = np.zeros(roi_n, dtype=np.float32)
-                roi[:hi] = sig[:hi]
-            else:
-                roi = sig[lo:hi]
-            roi = preprocess_roi(roi.astype(np.float64),
-                                 realign=realign, normalise=normalise).astype(np.float32)
-            if use_kymatio and scattering is not None:
-                fv = extract_family2_features_kymatio(roi, scattering)
-            else:
-                fv = extract_family2_features_numpy(roi, N=roi_n, J=4, Q=4)
-            for i, v in enumerate(fv):
-                out[f"{mic}_{tx}_S{i:04d}"] = float(v)
+    window: tuple[int, int] | None = None,
+    fs: float = FS_DEFAULT,
+    mics: Sequence[str] = ("Mic1", "Mic2", "Mic3"),
+    peaks: dict[str, int] | None = None,
+    before: int = WIN_BEFORE,
+    after: int = WIN_AFTER,
+    band=BAND,
+    J: int = SCAT_J,
+    Q: int = SCAT_Q,
+) -> "OrderedDict[str, float]":
+    out = OrderedDict()
+    for m in mics:
+        if m not in trial_signals:
+            continue
+        pk = None if peaks is None else peaks.get(m)
+        feats = extract_features2(trial_signals[m], fs=fs, window=window, peak=pk,
+                                  before=before, after=after, band=band, J=J, Q=Q)
+        for k, v in feats.items():
+            out[f"{m}_{k}"] = v
     return out
 
 
-# =================================================================
-# Self-test
-# =================================================================
-
 if __name__ == "__main__":
-    fs = 2_000_000
-    np.random.seed(0)
-    t = np.arange(1024) / fs
-    sig = np.sin(2 * np.pi * 50_000 * t) * np.hanning(1024)
-    sig += 0.1 * np.random.randn(1024)
-
-    print("Trying Kymatio path...")
-    try:
-        S = build_scattering(N=1024, J=8, Q=8)
-        feats = extract_family2_features_kymatio(sig, S)
-        print(f"  Kymatio: {len(feats)} features, mean={feats.mean():.3f}, std={feats.std():.3f}")
-    except ImportError as e:
-        print(f"  (skipped) {e}")
-
-    print("\nNumpy fallback...")
-    feats = extract_family2_features_numpy(sig, N=1024, J=4, Q=4)
-    print(f"  numpy: {len(feats)} features, mean={feats.mean():.3f}, std={feats.std():.3f}")
+    import pickle
+    with open("data_full/Multifrequenz/Box/75cm_0Grad.pickle", "rb") as fh:
+        df = pickle.load(fh)
+    x = np.asarray(df["Mic2"].iloc[0], dtype=float)
+    feats = extract_features2(x, window=(8624, 9648))
+    n1 = sum(k.startswith("ff2_s1_") for k in feats)
+    n2 = sum(k.startswith("ff2_s2_") for k in feats)
+    print(f"scattering: {len(feats)} coeffs (1 x s0, {n1} x s1, {n2} x s2), band {BAND} Hz, J={SCAT_J} Q={SCAT_Q}")
+    for k, v in list(feats.items())[:12]:
+        print(f"  {k:14s} {v:+.5g}")

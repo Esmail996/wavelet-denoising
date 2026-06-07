@@ -31,17 +31,80 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,
                              balanced_accuracy_score, classification_report)
 from sklearn.pipeline import Pipeline
 
 
-META_COLS = ("category", "distance_cm", "angle_deg", "trial")
+META_COLS = ("category", "distance_cm", "angle_deg", "trial", "file")
 LABEL_COL = "category"
+
+
+def _no_leak_exclusion_reason(col: str) -> str | None:
+    """Return exclusion reason for no_leak mode, or None if feature is allowed."""
+    if col.startswith("Mic3_"):
+        return "mic3_defective_channel"
+    if "_cwt_peakamp" in col:
+        return "absolute_amplitude_cwt_peakamp"
+    if "_wpt_snr_db" in col:
+        return "off_carrier_snr_wpt_snr_db"
+    if "_wpt_neighbour_leak" in col:
+        return "neighbour_leak_wpt"
+    if "_cwt_late_to_peak" in col:
+        return "tail_late_energy_cwt_late_to_peak"
+    return None
+
+
+def apply_feature_mode(
+    feat_cols: Sequence[str],
+    mode: str,
+) -> tuple[list[str], dict[str, int]]:
+    """Filter columns based on requested feature mode.
+
+    mode="normal": keep all feature columns.
+    mode="no_leak": drop leakage-prone columns listed in _no_leak_exclusion_reason.
+    """
+    if mode == "normal":
+        return list(feat_cols), {}
+
+    kept: list[str] = []
+    dropped_by_reason: dict[str, int] = {}
+    for c in feat_cols:
+        reason = _no_leak_exclusion_reason(c)
+        if reason is None:
+            kept.append(c)
+            continue
+        dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + 1
+    return kept, dropped_by_reason
+
+
+def normalise_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise input schema to expected meta column names.
+
+    Supports both legacy columns (category/distance_cm/angle_deg) and
+    extraction-only columns (object/distance/angle).
+    """
+    out = df.copy()
+    rename_map = {}
+    if "category" not in out.columns and "object" in out.columns:
+        rename_map["object"] = "category"
+    if "distance_cm" not in out.columns and "distance" in out.columns:
+        rename_map["distance"] = "distance_cm"
+    if "angle_deg" not in out.columns and "angle" in out.columns:
+        rename_map["angle"] = "angle_deg"
+    if rename_map:
+        out = out.rename(columns=rename_map)
+
+    required = {"category", "distance_cm", "angle_deg", "trial"}
+    missing = required - set(out.columns)
+    if missing:
+        raise ValueError(f"Missing required columns after schema normalisation: {sorted(missing)}")
+    return out
 
 
 def is_family15_col(c: str) -> bool:
@@ -76,34 +139,48 @@ def split_feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[
     return f1, f15, f2
 
 
-def make_classifiers(class_weight="balanced"):
+def make_classifiers(class_weight="balanced", skip_lightgbm: bool = False):
     """Return dict of name → sklearn-compatible estimator (uninstantiated pipeline)."""
     out = {
         "LR-L2": Pipeline([
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(C=1.0, max_iter=2000,
+            ("clf", LogisticRegression(C=0.3, max_iter=2000,
                                        class_weight=class_weight)),
         ]),
         "RandomForest": RandomForestClassifier(
-            n_estimators=300, max_depth=None,
+            n_estimators=400, max_depth=18, min_samples_leaf=4, max_features="sqrt",
             class_weight=class_weight, n_jobs=-1, random_state=0,
         ),
         "RBF-SVM": Pipeline([
             ("scaler", StandardScaler()),
-            ("clf", SVC(C=10.0, gamma="scale",
+            ("clf", SVC(C=3.0, gamma="scale",
                         class_weight=class_weight, random_state=0)),
         ]),
     }
     # LightGBM if available
-    try:
-        from lightgbm import LGBMClassifier
-        out["LightGBM"] = LGBMClassifier(
-            n_estimators=400, num_leaves=63, learning_rate=0.05,
-            class_weight=class_weight, n_jobs=-1, random_state=0, verbosity=-1,
-        )
-    except ImportError:
-        print("  (LightGBM not installed — skipping)")
+    if not skip_lightgbm:
+        try:
+            from lightgbm import LGBMClassifier
+            out["LightGBM"] = LGBMClassifier(
+                n_estimators=300, num_leaves=31, learning_rate=0.05,
+                min_child_samples=40, feature_fraction=0.7,
+                bagging_fraction=0.8, bagging_freq=1,
+                reg_alpha=0.1, reg_lambda=1.0,
+                class_weight=class_weight, n_jobs=1, random_state=0, verbosity=-1,
+            )
+        except ImportError:
+            print("  (LightGBM not installed — skipping)")
     return out
+
+
+def filter_classifiers(classifiers: dict[str, Any], only: Sequence[str] | None) -> dict[str, Any]:
+    if not only:
+        return classifiers
+    keep = [name.strip() for name in only if name.strip()]
+    missing = [k for k in keep if k not in classifiers]
+    if missing:
+        raise ValueError(f"Unknown classifier(s): {missing}. Available: {list(classifiers.keys())}")
+    return {k: classifiers[k] for k in keep}
 
 
 def evaluate_fold(clf, X_train, y_train, X_test, y_test):
@@ -125,7 +202,8 @@ def evaluate_fold(clf, X_train, y_train, X_test, y_test):
 
 
 def run_cv(df: pd.DataFrame, feat_cols: Sequence[str], clf_name: str,
-           clf, n_splits: int = 5, seed: int = 0) -> dict:
+           clf, n_splits: int = 5, seed: int = 0, cv_mode: str = "sgkf",
+           k_best: int = 0) -> dict:
     """Run StratifiedGroupKFold by (distance, angle). Each fold holds out
     a set of (distance, angle) cells across all 3 objects."""
     df = df.dropna(subset=list(feat_cols) + [LABEL_COL]).reset_index(drop=True)
@@ -134,13 +212,30 @@ def run_cv(df: pd.DataFrame, feat_cols: Sequence[str], clf_name: str,
     # Group: distinct (distance, angle) cells. There are 25.
     groups = df["distance_cm"].astype(str) + "_" + df["angle_deg"].astype(str)
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    logo = LeaveOneGroupOut()
     fold_results = []
     all_true, all_pred, all_groups = [], [], []
-    for fold, (tr_idx, te_idx) in enumerate(sgkf.split(X, y, groups)):
+    if cv_mode == "leave-one-cell":
+        split_iter = logo.split(X, y, groups)
+    else:
+        split_iter = sgkf.split(X, y, groups)
+
+    n_features_eff = len(feat_cols)
+    for fold, (tr_idx, te_idx) in enumerate(split_iter):
         # Important: fit-transform scaler within fold (no leakage)
         from sklearn.base import clone
         c = clone(clf)
-        res = evaluate_fold(c, X[tr_idx], y[tr_idx], X[te_idx], y[te_idx])
+        X_tr, X_te = X[tr_idx], X[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+
+        # Optional fold-safe feature selection for high-dimensional sets.
+        if k_best and 0 < int(k_best) < X_tr.shape[1]:
+            selector = SelectKBest(score_func=f_classif, k=int(k_best))
+            X_tr = selector.fit_transform(X_tr, y_tr)
+            X_te = selector.transform(X_te)
+            n_features_eff = X_tr.shape[1]
+
+        res = evaluate_fold(c, X_tr, y_tr, X_te, y_te)
         res["fold"] = fold
         fold_results.append(res)
         all_true.extend(res["y_true"].tolist())
@@ -149,7 +244,7 @@ def run_cv(df: pd.DataFrame, feat_cols: Sequence[str], clf_name: str,
 
     agg = {
         "clf": clf_name,
-        "n_features": len(feat_cols),
+        "n_features": int(n_features_eff),
         "n_trials": len(df),
         "mean_acc": float(np.mean([r["acc"] for r in fold_results])),
         "std_acc": float(np.std([r["acc"] for r in fold_results])),
@@ -179,13 +274,30 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cv", choices=["sgkf", "leave-one-cell"], default="leave-one-cell",
+                        help="Cross-validation mode. 'leave-one-cell' holds out exactly one (distance,angle) cell per fold.")
+    parser.add_argument("--skip-lightgbm", action="store_true",
+                        help="Skip LightGBM classifier.")
+    parser.add_argument("--only-classifiers", nargs="+", default=None,
+                        help="Optional subset of classifiers to run, e.g. --only-classifiers LightGBM")
+    parser.add_argument("--family-mode", choices=["all", "full"], default="all",
+                        help="Run all family combinations or only the full available feature set.")
+    parser.add_argument("--k-best", type=int, default=256,
+                        help="If >0, keep top-k ANOVA features per training fold (no leakage).")
     parser.add_argument("--add-distance-angle", action="store_true",
                         help="Include distance_cm + angle_deg as features")
+    parser.add_argument(
+        "--mode",
+        choices=["normal", "no_leak"],
+        default="normal",
+        help="Feature mode: normal keeps all columns, no_leak drops leakage-prone features.",
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading features from {args.features_csv}")
     df = pd.read_csv(args.features_csv)
+    df = normalise_schema(df)
     print(f"  {len(df)} rows × {df.shape[1]} cols")
     print(f"  classes: {df[LABEL_COL].value_counts().to_dict()}")
 
@@ -209,7 +321,33 @@ def main() -> None:
             new_families[k + "_with_da"] = cols + ["distance_cm", "angle_deg"]
         families.update(new_families)
 
-    classifiers = make_classifiers()
+    if args.family_mode == "full":
+        families = {"FULL": f1_cols + f15_cols + f2_cols}
+
+    # Apply feature mode after family composition so no_leak filtering is consistent
+    # across single families and combined families.
+    if args.mode == "no_leak":
+        filtered_families: dict[str, list[str]] = {}
+        total_dropped = 0
+        total_kept = 0
+        aggregate_reasons: dict[str, int] = {}
+        for fam_name, cols in families.items():
+            kept_cols, dropped_by_reason = apply_feature_mode(cols, mode=args.mode)
+            filtered_families[fam_name] = kept_cols
+            total_kept += len(kept_cols)
+            total_dropped += len(cols) - len(kept_cols)
+            for reason, cnt in dropped_by_reason.items():
+                aggregate_reasons[reason] = aggregate_reasons.get(reason, 0) + cnt
+
+        families = filtered_families
+        print("\n[mode=no_leak] leakage-prone features dropped")
+        print(f"  kept columns across family definitions: {total_kept}")
+        print(f"  dropped columns across family definitions: {total_dropped}")
+        for reason, cnt in sorted(aggregate_reasons.items()):
+            print(f"  - {reason}: {cnt}")
+
+    classifiers = make_classifiers(skip_lightgbm=args.skip_lightgbm)
+    classifiers = filter_classifiers(classifiers, args.only_classifiers)
 
     summary_rows = []
     all_per_cell = {}
@@ -223,7 +361,8 @@ def main() -> None:
             print(f"  Training {clf_name}...")
             try:
                 res = run_cv(df, cols, clf_name, clf,
-                             n_splits=args.n_splits, seed=args.seed)
+                             n_splits=args.n_splits, seed=args.seed, cv_mode=args.cv,
+                             k_best=args.k_best)
             except Exception as e:
                 print(f"    FAILED: {e}")
                 continue

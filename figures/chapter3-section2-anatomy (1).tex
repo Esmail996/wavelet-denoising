@@ -1,0 +1,439 @@
+%======================================================================
+\section{Anatomy of a Multifrequenz signal trial}
+\label{sec:signal-anatomy}
+
+Before describing how the recordings are denoised, this section
+investigates what they actually contain. Each trial is a
+\SI{9}{\milli\second} waveform in which acoustic, electronic, and
+mechanical effects overlap in time. Identifying which samples belong
+to which physical process is a prerequisite for the design decisions
+that follow: where to apply blanking, which region can be used for
+noise variance estimation, and what the matched filter and the
+wavelet decomposition will see.
+
+The analysis is performed on a representative cell of the dataset:
+the \texttt{Box} target at \SI{75}{cm} and $0\degree$, recorded on
+\texttt{Mic2}, averaged across all 100 trials in the file. The
+\texttt{Mic2} channel is chosen because it is the central
+microphone of the matched pair and because the \SI{75}{cm} distance
+is intermediate within the protocol grid, allowing the full
+sequence of signal regions to be observed within a single trial.
+A reference (target-absent) recording, also averaged over 100
+trials, is used throughout as a baseline to distinguish acoustic
+content from hardware-driven content.
+
+\subsection{The transmission burst}
+\label{sec:transmission-burst}
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=0.95\linewidth]{Pictures/fig_anatomy_full.png}
+    \caption{Single trial of the Multifrequenz dataset
+        (\texttt{Box}, \SI{75}{cm}, $0\degree$, \texttt{Mic2},
+        trial 0). Shading indicates the four signal regions
+        identified empirically: (A) transmission burst, samples
+        0--600; (B) transducer and microphone ringdown, samples
+        600--2000; (C) stationary multipath from room reflections,
+        samples 2000--10000; (D) noise floor, samples 10000--18000.
+        The dashed blue line at sample 2400 marks the front-end
+        blanking boundary used downstream.}
+    \label{fig:anatomy-full}
+\end{figure}
+
+Figure~\ref{fig:anatomy-full}
+shows a single trial from this cell with four signal regions
+annotated. The first \SI{0.3}{\milli\second} (samples 0 to
+approximately 600) contains the transmission burst itself. The
+recorded amplitude in this region reaches the limits of the
+\num{12}-bit \gls{adc} dynamic range, with the analog stage close
+to saturation. The burst is not pure direct-coupling
+electromagnetic crosstalk: the receiver records mechanical
+displacement of the microphone diaphragm in response to the
+acoustic field, and the transmitter--microphone separation of only
+\SI{5}{mm} on the PCB means the first wavefront arrives at the
+microphone within approximately \SI{15}{\micro\second} of the
+transmitter activation. The burst is therefore predominantly an
+acoustic event recorded at extremely short range, on top of an
+electromagnetic component that is unavoidable given the analog
+proximity of the transmitter drive lines.
+
+A spectral analysis of this region reveals the defining property of
+the Multifrequenz dataset. The three transmitters fire
+simultaneously, each at its assigned carrier frequency of
+\SI{40}{kHz}, \SI{50}{kHz}, or \SI{60}{kHz}. The recorded burst at
+the microphone therefore contains all three carriers concurrently.
+After a Hann-windowed Fourier transform of the burst region, the
+three carrier peaks are within \SI{3.5}{dB} of each other in
+magnitude, with the \SI{40}{kHz} component the strongest in this
+dataset --- consistent with the receiver's larger response at
+frequencies near its \SI{39}{kHz} resonance.
+This simultaneous excitation determines several downstream design
+choices: the matched filter must process each carrier band
+separately (Chapter~\ref{chapter:tof}), and the wavelet
+decomposition in Section~\ref{sec:wavelet-denoising} must either
+preserve all three bands or address them separately depending on
+the branch used.
+
+The envelope of the burst shows a max-to-mean ratio of
+approximately \num{1.7}, which is intermediate between a perfectly
+rectangular window (ratio \num{1.0}) and a Hann window (ratio
+\num{2.0}). The observed shape is a product of the drive waveform
+and the impulse response of the transducer; the exact window shape
+of the drive signal cannot be inferred unambiguously from the
+recording alone, and is not necessary for the analysis that follows.
+
+\subsection{Transducer ringdown}
+\label{sec:ringdown}
+
+After the transmitter drive cuts off at approximately
+\SI{0.3}{\milli\second}, the recorded amplitude decays exponentially
+as the piezoelectric transmitter element and the microphone
+diaphragm continue to oscillate at their respective resonant
+frequencies. For a resonator with quality factor $Q$ at frequency
+$f_0$, the envelope decays as $e^{-t/\tau}$ with time constant
+$\tau = Q / (\pi f_0)$. For the Knowles SPH18C3LM4H-1 microphone,
+Table~2 of the datasheet \citep{Knowles2020} specifies a resonant
+peak at \SI{39}{kHz} but does not quote a quality factor. A
+quality factor can be estimated from the curve in Figure~7 of the
+datasheet by reading the $-3$~dB points around the resonance peak;
+this estimate is approximately $Q \approx 2.5$, although the
+limited resolution of the figure makes it uncertain by a factor of
+roughly two. Adopting $Q \approx 2.5$ as a working value gives
+\begin{equation}
+    \tau \approx \frac{2.5}{\pi \cdot \SI{39}{kHz}}
+            \approx \SI{20}{\micro\second}.
+    \label{eq:tau-ringdown}
+\end{equation}
+The hardware engineer's own expectation, given that the
+\SI{40}{kHz} carrier sits at the resonance peak, was that the
+microphone should not exhibit substantial ringing in operation.
+At the time constant in
+Equation~\eqref{eq:tau-ringdown}, the ringdown amplitude falls by
+a factor of $e^{-50}$ in just \SI{1}{\milli\second}, so a pure
+exponential ringdown from the burst peak should reach the noise
+floor in well under \SI{1}{\milli\second}, in line with that
+expectation.
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=0.95\linewidth]{Pictures/fig_anatomy_decay.png}
+    \caption{Reference envelope decay (Hilbert magnitude, averaged
+        over 100 trials, blue) compared to a pure exponential
+        decay with $Q \approx 2.5$ at $f_0 = \SI{39}{kHz}$
+        ($\tau \approx \SI{20}{\micro\second}$, red dashed),
+        anchored at the end of the transmission burst at sample
+        600. The empirical envelope tracks the theoretical decay
+        only for the first $\sim$\SI{0.5}{\milli\second}; beyond
+        that, the empirical curve lies an order of magnitude or
+        more above the theoretical line, and from approximately
+        \SI{1}{\milli\second} onwards it ceases to be monotonic.
+        The non-monotonic behaviour is incompatible with a single
+        ringdown process and identifies the
+        \SIrange{1}{5}{\milli\second} region as stationary
+        multipath rather than continued ringdown.}
+    \label{fig:anatomy-decay}
+\end{figure}
+
+Figure~\ref{fig:anatomy-decay}
+compares the empirical envelope of the reference recording (Hilbert
+magnitude, averaged over 100 trials) against this theoretical
+exponential decay, anchored at the end of the transmission burst.
+The empirical envelope tracks the pure-ringdown prediction closely
+for approximately the first \SI{0.5}{\milli\second}; thereafter, the
+empirical envelope lies an order of magnitude or more above the
+theoretical line. From approximately \SI{1}{\milli\second} onwards
+the empirical envelope ceases to decay monotonically, exhibiting
+local maxima and minima rather than a clean exponential tail. This
+non-monotonic behaviour is incompatible with a single ringdown
+process and motivates a separate identification of what dominates
+the recording between \SI{1}{\milli\second} and the noise floor.
+
+\subsection{Stationary multipath from room reflections}
+\label{sec:multipath}
+
+Between samples 2000 and 10000 (approximately
+\SI{1}{\milli\second} to \SI{5}{\milli\second}), the envelope shows
+bumps that rise and fall on time scales of a few hundred
+microseconds, with overall amplitude decreasing slowly toward the
+noise floor. These bumps are present in the reference recording,
+where no target is placed in front of the array, and they are
+essentially identical across the 100 trials of any one file --- the
+across-trial standard deviation of the envelope in this region is
+small compared to its trial-averaged mean.
+
+Two observations identify this content as stationary multipath
+from the test setup rather than acoustic returns from the target
+or from continuing transducer resonance. First, it persists
+identically in the absence of a target, ruling out target-related
+echoes. Second, its envelope is not monotonic, ruling out a single
+ringing resonator: the local maxima at approximately
+\SI{1.5}{\milli\second}, \SI{2.5}{\milli\second}, and
+\SI{4.3}{\milli\second} are consistent with acoustic returns from
+reflectors at distances of roughly \SI{25}{cm}, \SI{40}{cm}, and
+\SI{70}{cm} from the array --- compatible with the dimensions of
+the benchtop test setup, the housing of the array assembly, and
+nearby fixtures.
+
+The presence of stationary multipath has two implications. First,
+the noise process at long range is correlated rather than white,
+which affects the optimality of any matched-filter detection scheme
+formulated under the white-noise assumption. The hardware engineer
+who acquired the dataset reports that an initial naive attempt at
+time-of-flight extraction --- bandpass filtering the
+\texttt{Mic2} recordings at \SI{40}{kHz}, \SI{50}{kHz}, and
+\SI{60}{kHz} separately and searching for a single envelope peak per
+carrier --- was unsuccessful, and explicitly attributes the
+difficulty to ``reflections from the environment''. The empirical
+findings here are consistent with that statement: the reflections
+are stationary, occupy the carrier bands, and remain visible in
+target-absent recordings.
+% NOTE: The engineer's statement is paraphrased from notes the
+% author has shared in the conversation. If those notes become
+% formally archived in the iCampus cloud or as a project
+% technical report, replace this attribution with a \citep{} to
+% that document. No external literature citation is required for
+% this paragraph, since the relevant observation is documented
+% within the project itself.
+Second, the multipath component is deterministic in the sense that
+it depends on the geometry of the test setup rather than on the
+target, so any wavelet shrinkage that suppresses it must do so on
+the basis of its time--frequency structure rather than its
+randomness. The denoising scheme described in
+Section~\ref{sec:wavelet-denoising} treats the multipath tail as
+correlated additive content with energy concentrated in the same
+carrier bands as the signal-of-interest, and relies on the time
+localisation of the wavelet basis to separate the multipath energy
+(spread across a long tail) from the burst energy of the direct
+echo (concentrated in a short interval).
+
+\subsection{The direct echo}
+\label{sec:direct-echo}
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=0.95\linewidth]{Pictures/fig_anatomy_rms.png}
+    \caption{RMS amplitude in 200-sample (\SI{100}{\micro\second})
+        windows for the \texttt{Box} at \SI{75}{cm} and $0\degree$
+        (red) and for the target-absent reference (blue), both
+        averaged over 100 trials. Logarithmic vertical axis. The
+        two curves are essentially identical except at the direct
+        echo near \SI{4.4}{\milli\second} and at the end-of-trial
+        multi-bounce echo near \SI{8.7}{\milli\second}. The
+        shaded grey region indicates the stationary-multipath
+        interval; the dashed vertical line marks the blanking
+        boundary at sample 2400.}
+    \label{fig:anatomy-rms}
+\end{figure}
+
+Between samples \num{8800} and \num{9300}
+(approximately \SI{4.4}{\milli\second}), Figure~\ref{fig:anatomy-rms}
+shows a clear divergence between the measurement and reference RMS
+profiles. The measurement RMS rises from approximately \num{4} to
+above \num{30} \gls{adc} units; the reference remains flat near
+the noise floor. This is the direct echo: the burst reflected from
+the target back to the microphone. The arrival time of
+\SI{4.4}{\milli\second} matches the expected geometric round trip
+of $2 \cdot \SI{0.75}{\meter} / \SI{343}{\meter\per\second} =
+\SI{4.37}{\milli\second}$ to within the resolution of the
+\SI{100}{\micro\second} averaging window.
+
+The spectral content of the direct echo, computed over samples
+\num{8800} to \num{9300}, shows all three carriers present at
+roughly equal magnitude, consistent with the simultaneous Tx
+firing described in Section~\ref{sec:transmission-burst} and with
+the acoustic propagation introducing negligible
+frequency-dependent attenuation over the \SI{75}{cm} path. The
+direct echo is, in this sense, a true ``copy'' of the transmitted
+multi-frequency burst, scaled and time-shifted by the bistatic
+geometry. This is the signal-of-interest for the matched filter
+and the wavelet denoiser.
+
+At the shortest protocol distance of \SI{25}{cm}, the direct echo
+arrives at approximately \SI{1.5}{\milli\second}, immediately after
+the transducer ringdown has ended at \SI{1}{\milli\second}. The
+ringdown amplitude at \SI{0.3}{\milli\second}, near its peak, is
+approximately \num{5} times the direct-echo peak at \SI{25}{cm};
+by \SI{0.5}{\milli\second} the ringdown has dropped to below the
+echo amplitude; and by \SI{0.8}{\milli\second} it is roughly one
+order of magnitude smaller than the echo. The current blanking
+length of \num{2400} samples (\SI{1.2}{\milli\second}), introduced
+in the next section, removes both the burst and the residual
+ringdown while leaving the entire \SI{25}{cm} echo intact.
+
+\subsection{The end-of-trial peak}
+\label{sec:end-peak}
+
+A secondary feature in Figure~\ref{fig:anatomy-rms} is the small
+RMS bump in the measurement at approximately
+\SI{8.7}{\milli\second} (samples 17400 to 17800). The reference
+shows no such feature. The position and the conditional appearance
+of this peak make it worth investigating in its own right, both to
+explain what it is and to determine whether the back end of the
+trial should also be blanked.
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=0.95\linewidth]{Pictures/fig_anatomy_endpeak.png}
+    \caption{Investigation of the end-of-trial peak.
+        \textbf{Top:} RMS profile in the interval
+        \SIrange{7.0}{9.0}{\milli\second} for the \texttt{Box}
+        target at all five protocol distances
+        (\SIlist{25;50;75;100;125}{cm}), with the
+        target-absent reference overlaid as a dashed black line.
+        The large peak at \SI{7.3}{\milli\second} in the
+        \SI{125}{cm} trace is the direct echo at long range. The
+        smaller peaks near \SI{8.7}{\milli\second} in the
+        \SI{50}{cm} and \SI{75}{cm} traces are the multi-bounce
+        echo. \textbf{Bottom:} Spectrum of the direct echo
+        (samples \numrange{8800}{9300}, red) and of the end peak
+        (samples \numrange{17400}{17900}, blue) for the
+        \texttt{Box} at \SI{75}{cm}, averaged over 100 trials.
+        The direct echo contains all three carriers at
+        approximately equal magnitude; the end peak is dominated
+        by \SI{40}{kHz}, with the higher carriers progressively
+        attenuated --- consistent with two acoustic
+        reflection-plus-propagation cycles.}
+    \label{fig:anatomy-endpeak}
+\end{figure}
+
+Figure~\ref{fig:anatomy-endpeak}
+shows the end-of-trial region (samples 14000 to 18000) for the
+\texttt{Box} target at all five protocol distances. At
+\SI{125}{cm}, the entire end region is dominated by a large peak
+at \SI{7.3}{\milli\second} --- this is the direct echo at long
+range, where the geometric round-trip time of
+$2 \cdot \SI{1.25}{\meter} / \SI{343}{\meter\per\second} =
+\SI{7.29}{\milli\second}$ falls inside this window. At
+\SI{100}{cm}, the direct echo arrives at \SI{5.83}{\milli\second}
+(outside the end region) and the recording is at the noise floor.
+At \SI{75}{cm} and \SI{50}{cm}, a smaller peak appears near
+\SI{8.7}{\milli\second}, and the same peak is absent at
+\SI{25}{cm} and \SI{100}{cm}.
+
+The position of this secondary peak relative to the direct echo
+matches a double round trip. For the \SI{75}{cm} case, the direct
+echo is at \SI{4.37}{\milli\second} and the end peak is at
+\SI{8.7}{\milli\second} --- a difference of
+\SI{4.33}{\milli\second}, equal to a second round trip between
+the array and the target. The mechanism is acoustic reciprocity:
+the direct echo arrives at the receiver array, a fraction of it
+re-radiates back toward the target, reflects, and returns to the
+array a second time. The spectral content of the end peak,
+visible in the lower panel of Figure~\ref{fig:anatomy-endpeak},
+supports this interpretation: the \SI{40}{kHz} component
+dominates, with \SI{50}{kHz} attenuated by approximately
+\SI{8}{dB} and \SI{60}{kHz} attenuated by approximately
+\SI{19}{dB} relative to the direct echo's spectrum at the same
+frequencies. This monotonic frequency-dependent attenuation is
+consistent with two acoustic reflection-plus-propagation cycles,
+each of which absorbs higher frequencies preferentially.
+
+The end peak is also object-dependent. At the same \SI{75}{cm}
+distance and $0\degree$ angle, the end-peak RMS is approximately
+\num{6.7} for \texttt{Box}, \num{4.5} for \texttt{Glas}, and only
+\num{2.1} for \texttt{Dose} --- the latter being indistinguishable
+from the noise floor. The cardboard \texttt{Box} reflects in a
+sufficiently diffuse and broadband manner to support two
+round-trip cycles; the metal \texttt{Dose} produces a strong first
+echo but the geometry of subsequent reflections is unfavourable.
+
+The implication for the blanking design is that the end-of-trial
+region should \emph{not} be blanked. The multi-bounce signal is a
+genuine acoustic event whose presence and shape carry information
+about the target. It is potentially useful for classification, and
+because the noise variance estimate is computed from the reference
+recording (Section~\ref{sec:denoising-noise-estimation}) rather
+than from the measurement trial, the end peak does not contaminate
+the threshold used by the wavelet shrinkage step. No back-end
+blanking is applied in this thesis.
+
+\subsection{Implications for blanking and noise estimation}
+\label{sec:anatomy-implications}
+
+Three implications for the denoising pipeline follow from this
+analysis.
+
+First, the front-end blanking of \num{2400} samples
+(\SI{1.2}{\milli\second}), described in
+Section~\ref{sec:denoising-blanking}, removes the transmission
+burst and the transducer ringdown without affecting any genuine
+echo. The shortest protocol distance of \SI{25}{cm} corresponds to
+a round-trip time of \SI{1.46}{\milli\second}, so any echo arrives
+no earlier than sample \num{2920} --- comfortably after the
+blanking boundary. By \SI{1.2}{\milli\second} the ringdown is
+already an order of magnitude below the \SI{25}{cm} echo peak,
+making the blanking redundant for echo preservation but valuable
+for what it removes from any per-trial signal energy estimate.
+
+Second, between the blanking boundary and approximately
+\SI{5}{\milli\second}, the recording contains stationary multipath
+from the test environment. The amplitude in this region is small
+compared to the burst (typically \num{10} to \num{50} \gls{adc}
+units) but well above the noise floor of \num{2} \gls{adc} units,
+and it is correlated across trials. Any noise-variance estimate
+that pools samples from this region in the time domain will be
+biased upward by the multipath energy. The wavelet-domain
+estimator used in Section~\ref{sec:denoising-noise-estimation}
+sidesteps this bias by estimating the noise variance from a wavelet
+detail level that contains no carrier-band content, isolating
+broadband noise from the multipath energy concentrated near the
+carriers.
+
+Third, the noise process is not white: it is dominated, in the
+operational time range of the recording, by correlated multipath
+returns from the test setup. Matched-filter detection schemes
+formulated under a white-noise assumption are therefore not
+strictly optimal in this dataset, and the denoising stage acts in
+part as a means of suppressing this correlated component before
+the matched filter is applied. The wavelet basis is well suited to
+this task because the multipath energy is spread across the
+\SI{1}{\milli\second} to \SI{5}{\milli\second} interval --- a long
+tail in the time domain, which corresponds to a small number of
+large coefficients only at the coarsest wavelet scales --- whereas
+the direct echo is a localised burst that produces large
+coefficients at the scales matched to its envelope width.
+
+%======================================================================
+% Sources used in Section 3.2
+%
+% 1. Engineer's notes (text provided verbatim by the author in the
+%    conversation):
+%    - "Find time-of-flight ... not possible due to reflections
+%      from the environment" — direct attribution of the multipath
+%      problem to environmental reflections, used in
+%      Section 3.2.3 (stationary multipath subsection).
+%    - "The resonance frequency is around 39 kHz, so there should
+%      not be any ringing" — engineer's a priori expectation,
+%      referenced in Section 3.2.2 (ringdown subsection).
+%
+% 2. Knowles SPH18C3LM4H-1 datasheet \citep{Knowles2020}:
+%    - Table 2: Fres = 39 kHz (used for the time constant
+%      calculation in Section 3.2.2)
+%    - Figure 7: Free Field Ultrasonic Response (used to estimate
+%      Q ≈ 2.5 from the curve, with the uncertainty acknowledged
+%      explicitly in the prose)
+%
+% 3. The dataset itself (verified by signal_anatomy.py):
+%    - Region boundaries (0.3 ms, 1.0 ms, 5.0 ms)
+%    - Spectral content of direct echo and end peak
+%    - End-peak position and object dependence
+%    - RMS comparison of measurement and reference
+%
+% TODO-AUTHOR items in Section 3.2:
+%
+% 1. If the engineer's notes are formally archived (in the iCampus
+%    cloud or as a project technical report), replace the inline
+%    attribution in Section 3.2.3 with a \citep{} to that document.
+%    Currently the text refers to "the hardware engineer reports"
+%    in prose.
+%
+% TODO-FIGURE items in Section 3.2:
+%
+% 1. fig_anatomy_full.png — generated by signal_anatomy.py
+% 2. fig_anatomy_decay.png — generated by signal_anatomy.py
+% 3. fig_anatomy_rms.png — generated by signal_anatomy.py
+% 4. fig_anatomy_endpeak.png — generated by signal_anatomy.py
+% (fig_anatomy_spectrogram.png is generated but not directly cited
+%  in the section text; available as a supplementary figure or
+%  for the wavelet-choice section later.)
+%======================================================================
